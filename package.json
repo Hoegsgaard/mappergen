@@ -1,0 +1,81 @@
+{
+	"name": "mappergen",
+	"version": "0.0.1",
+	"private": false,
+	"description": "Generate type-safe object mappers from TypeScript method signatures",
+	"keywords": [
+		"typescript",
+		"mapper",
+		"object-mapping",
+		"dto",
+		"code-generation",
+		"vite-plugin"
+	],
+	"author": "Mathias Høgsgaard",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Hoegsgaard/mappergen.git"
+	},
+	"homepage": "https://github.com/Hoegsgaard/mappergen#readme",
+	"bugs": {
+		"url": "https://github.com/Hoegsgaard/mappergen/issues"
+	},
+	"type": "module",
+	"sideEffects": false,
+	"exports": {
+		".": {
+			"types": "./dist/runtime.d.ts",
+			"import": "./dist/runtime.js"
+		},
+		"./compiler": {
+			"types": "./dist/generate.d.ts",
+			"import": "./dist/generate.js"
+		},
+		"./vite": {
+			"types": "./dist/vite.d.ts",
+			"import": "./dist/vite.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"bin": {
+		"mappergen": "dist/cli.js"
+	},
+	"files": [
+		"dist",
+		"src",
+		"README.md"
+	],
+	"engines": {
+		"node": "^22.12.0 || ^24.0.0 || ^26.0.0"
+	},
+	"scripts": {
+		"build": "tsc6 -p tsconfig.build.json",
+		"typecheck": "tsc6 -p tsconfig.json",
+		"check": "npm run build && node dist/cli.js --project examples/basic/tsconfig.json --validate",
+		"pretest": "npm run build && tsc6 -p tsconfig.test.json",
+		"test": "node --test .test-dist/*.test.js",
+		"prepare": "npm run build",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"verify": "npm run format:check && npm test && node dist/cli.js --project examples/basic/tsconfig.json --validate"
+	},
+	"dependencies": {
+		"@typescript/typescript6": "~6.0.2",
+		"magic-string": "^1.4.1"
+	},
+	"peerDependencies": {
+		"vite": "^8.2.1"
+	},
+	"peerDependenciesMeta": {
+		"vite": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@jridgewell/trace-mapping": "0.3.31",
+		"@types/node": "^22.0.0",
+		"prettier": "3.9.6",
+		"vite": "8.2.1"
+	}
+}

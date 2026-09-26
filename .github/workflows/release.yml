@@ -1,0 +1,137 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+      publish:
+        description: Publish the release (unchecked = preview only)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  package:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Require the current default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" || { echo 'Start Release from the default branch.'; exit 1; }
+          git fetch origin "$DEFAULT_BRANCH" --tags
+          test "$(git rev-parse "origin/$DEFAULT_BRANCH")" = "$GITHUB_SHA" || { echo 'The branch advanced. Start a new Release run from its latest commit.'; exit 1; }
+      - name: Check release prerequisites
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          PUBLISH_ENABLED: ${{ vars.NPM_PUBLISH_ENABLED }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const fail = message => { throw new Error(message); };
+          if (!/^\d+\.\d+\.\d+$/.test(p.version)) fail('This workflow supports stable versions only.');
+          const npmVersion = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim();
+          const [major, minor, patch] = npmVersion.split('.').map(Number);
+          if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
+            fail('npm 11.5.1 or newer is required for trusted publishing.');
+          }
+          if (process.env.PUBLISH === 'true') {
+            if (process.env.PUBLISH_ENABLED !== 'true') fail('Configure trusted publishing before enabling NPM_PUBLISH_ENABLED.');
+            if (p.private !== false) fail('Explicitly set private: false for the approved release.');
+            if (p.name !== 'mappergen') fail('Expected the mappergen package.');
+            if (p.license !== 'MIT' || !fs.existsSync('LICENSE')) fail('Expected the MIT license and LICENSE file.');
+            const expected = `https://github.com/${process.env.GITHUB_REPOSITORY}`;
+            const repository = typeof p.repository === 'string' ? p.repository : p.repository?.url;
+            if (repository?.replace(/^git\+/, '').replace(/\.git$/, '') !== expected) fail('repository.url must match this GitHub repository.');
+            if (p.homepage !== `${expected}#readme` || p.bugs?.url !== `${expected}/issues`) fail('homepage and bugs.url must match this GitHub repository.');
+          }
+          NODE
+      - name: Install dependencies
+        run: npm ci
+      - name: Prepare next version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          case "$BUMP" in patch|minor|major) ;; *) exit 1 ;; esac
+          npm version "$BUMP" --no-git-tag-version --ignore-scripts
+          npm exec -- prettier --write package.json
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            echo "Tag $TAG already exists. Resolve the earlier release before starting another."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "### Release $TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify the versioned package
+        run: npm run verify
+      - name: Create local release commit and tag
+        if: inputs.publish
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json package-lock.json
+          git commit -m "chore(release): $TAG"
+          git tag -a "$TAG" -m "$TAG"
+      - name: Pack
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/npm-release
+        run: mkdir -p "$PACKAGE_DIR" && npm pack --ignore-scripts --pack-destination "$PACKAGE_DIR"
+      - name: Dry-run publication
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/npm-release
+        run: npm publish "$PACKAGE_DIR"/*.tgz --dry-run --access public --ignore-scripts
+      - name: Save release tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-package-${{ steps.version.outputs.tag }}
+          path: ${{ runner.temp }}/npm-release/*.tgz
+          if-no-files-found: error
+          compression-level: 0
+      - name: Push version commit and tag together
+        if: inputs.publish
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: git push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "refs/tags/$TAG"
+      - name: Publish verified tarball using npm trusted publishing
+        if: inputs.publish
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/npm-release
+        run: npm publish "$PACKAGE_DIR"/*.tgz --access public --ignore-scripts
+      - name: Create GitHub Release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PACKAGE_DIR: ${{ runner.temp }}/npm-release
+        run: gh release create "$TAG" "$PACKAGE_DIR"/*.tgz --verify-tag --title "$TAG" --generate-notes

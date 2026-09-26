@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest an improvement to MapperGen.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to map, and what prevents you from doing it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: A small example of the mapper you would like to write is helpful.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: Describe any approaches you have tried.
