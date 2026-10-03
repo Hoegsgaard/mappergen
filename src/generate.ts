@@ -130,6 +130,9 @@ export function generateWithMaps(
 		);
 	};
 
+	const hasFlag = (type: TypeScript.Type, flag: TypeScript.TypeFlags): boolean =>
+		type.isUnion() ? type.types.some((t) => hasFlag(t, flag)) : Boolean(type.flags & flag);
+
 	const getObjectProperties = (
 		type: TypeScript.Type,
 		node: TypeScript.Node,
@@ -374,7 +377,13 @@ export function generateWithMaps(
 						if (isUnsupportedType(sourceType))
 							fail(method, `Source '${sourceName}' has an unsupported type.`);
 
-						let expression = `source[${JSON.stringify(sourceName)}]`;
+						// Captured before expression is rewritten, so a guard never wraps a conversion.
+						const access = `source[${JSON.stringify(sourceName)}]`;
+						const sourceOptional = Boolean(sourceProperty.flags & ts.SymbolFlags.Optional);
+						const targetOptional = Boolean(property.flags & ts.SymbolFlags.Optional);
+						let expression = access;
+						// Emit the field conditionally; only the direct-copy path sets a guard.
+						let guard: string | undefined;
 						if (rule.convert) {
 							const converter = mapperClass.members.find(
 								(m): m is TypeScript.MethodDeclaration =>
@@ -424,29 +433,59 @@ export function generateWithMaps(
 									method,
 									`Field '${property.name}' needs an explicit converter: automatic nested-object/array copying is disabled.`,
 								);
-							if (!checker.isTypeAssignableTo(sourceType, targetType))
+
+							// Reading an optional property yields `T | undefined`, even under
+							// exactOptionalPropertyTypes, where the symbol type drops that member.
+							const readType = sourceOptional
+								? checker.getNullableType(sourceType, ts.TypeFlags.Undefined)
+								: sourceType;
+							const targetNull = hasFlag(targetType, ts.TypeFlags.Null);
+							const targetUndefined = hasFlag(targetType, ts.TypeFlags.Undefined);
+
+							// Compare payloads; null/undefined differences are lifted below, not rejected.
+							if (
+								!checker.isTypeAssignableTo(
+									checker.getNonNullableType(readType),
+									checker.getNonNullableType(targetType),
+								)
+							)
 								fail(
 									method,
-									`Field '${property.name}': ${checker.typeToString(sourceType)} is not assignable to ${checker.typeToString(targetType)}; add @convert.`,
+									`Field '${property.name}': ${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}; add @convert.`,
 								);
+
+							// Absence alone is handled by the `in` guard; a declared `undefined` is not.
+							const absenceOnly = sourceOptional && !hasFlag(sourceType, ts.TypeFlags.Undefined);
+							const liftNull = hasFlag(readType, ts.TypeFlags.Null) && !targetNull;
+							const liftUndefined =
+								hasFlag(readType, ts.TypeFlags.Undefined) &&
+								!targetUndefined &&
+								!(targetOptional && absenceOnly);
+
+							if (liftNull || liftUndefined) {
+								// Optional targets are omitted rather than assigned, so the result does
+								// not depend on exactOptionalPropertyTypes. A required key cannot be
+								// omitted, so it coalesces to whichever empty value the target allows.
+								if (targetOptional) guard = `${access} ${targetNull ? '!== undefined' : '!= null'}`;
+								else if (targetUndefined) expression = `${access} ?? undefined`;
+								else if (targetNull) expression = `${access} ?? null`;
+								else
+									fail(
+										method,
+										`Field '${property.name}': ${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}; make the target optional or allow null or undefined, or add @convert.`,
+									);
+							} else if (targetOptional && sourceOptional) {
+								guard = `${JSON.stringify(sourceName)} in source`;
+							}
 						}
 
-						// Under exactOptionalPropertyTypes, omit an absent optional field instead of assigning undefined.
-						const optional =
-							property.flags & ts.SymbolFlags.Optional &&
-							sourceProperty.flags & ts.SymbolFlags.Optional &&
-							!rule.convert;
 						if (constructor) {
 							const assignment = `target[${JSON.stringify(property.name)}] = ${expression};`;
-							assignments.push(
-								optional
-									? `    if (${JSON.stringify(sourceName)} in source) { ${assignment} }`
-									: `    ${assignment}`,
-							);
+							assignments.push(guard ? `    if (${guard}) { ${assignment} }` : `    ${assignment}`);
 						} else {
 							assignments.push(
-								optional
-									? `      ...(${JSON.stringify(sourceName)} in source ? { ${JSON.stringify(property.name)}: ${expression} } : {}),`
+								guard
+									? `      ...(${guard} ? { ${JSON.stringify(property.name)}: ${expression} } : {}),`
 									: `      ${JSON.stringify(property.name)}: ${expression},`,
 							);
 						}

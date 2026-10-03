@@ -13,6 +13,8 @@ export class SensorDto {
 	id!: string;
 	name!: string;
 	reading!: number;
+	// MapperGen bridges `string | null` from the row into this optional field without
+	// a converter; a null row value leaves it undefined.
 	description?: string;
 }
 
@@ -21,16 +23,11 @@ export abstract class SensorMapping {
 	/**
 	 * @map target=name source=sensorName
 	 * @convert reading toNumber
-	 * @convert description nullToUndefined
 	 */
 	abstract toDto(source: SensorRow): SensorDto;
 
 	protected toNumber(value: string): number {
 		return Number(value);
-	}
-
-	protected nullToUndefined(value: string | null): string | undefined {
-		return value ?? undefined;
 	}
 }
 

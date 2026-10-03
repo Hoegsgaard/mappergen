@@ -454,13 +454,13 @@ for (const { name, source, target, expected } of [
 		name: 'nullable sources cannot fill non-nullable targets',
 		source: '{ id: string | null }',
 		target: '{ id: string }',
-		expected: /not assignable/,
+		expected: /make the target optional or allow null or undefined/,
 	},
 	{
 		name: 'optional sources cannot fill required targets',
 		source: '{ id?: string }',
 		target: '{ id: string }',
-		expected: /not assignable/,
+		expected: /make the target optional or allow null or undefined/,
 	},
 	{
 		name: 'any source fields cannot bypass type safety',
@@ -693,3 +693,290 @@ export abstract class Mapper {
 	// Assert
 	assert.deepEqual(result, { name: 'Outdoor', reading: 12.5 });
 });
+
+// Automatic null/undefined lifting. Shapes whose emission depends on
+// exactOptionalPropertyTypes are exercised under both settings.
+for (const exactOptionalPropertyTypes of [false, true]) {
+	const eopt = `EOPT=${exactOptionalPropertyTypes}`;
+	const options = { exactOptionalPropertyTypes };
+
+	test(`omits a nullable source for an optional target (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { remark: string | null }): { remark?: string };
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toDto({ remark: null }), {});
+		assert.deepEqual(mapper.toDto({ remark: 'note' }), { remark: 'note' });
+	});
+
+	test(`fills a nullable target from an absent optional source (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper {
+  abstract toRow(source: { remark?: string }): { remark: string | null };
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toRow({}), { remark: null });
+		assert.deepEqual(mapper.toRow({ remark: 'note' }), { remark: 'note' });
+	});
+
+	test(`keeps null for an optional target that allows it (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { remark: string | null | undefined }): { remark?: string | null };
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert: null stays null rather than collapsing into absence.
+		assert.deepEqual(mapper.toDto({ remark: null }), { remark: null });
+		assert.deepEqual(mapper.toDto({ remark: 'note' }), { remark: 'note' });
+		// Without the flag this field is a plain copy, so the key is present and undefined;
+		// under the flag it is omitted. Both read back as undefined.
+		assert.equal(mapper.toDto({ remark: undefined }).remark, undefined);
+	});
+
+	test(`omits an explicitly undefined optional source for an optional target (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { remark?: string | undefined }): { remark?: string };
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toDto({}), {});
+		assert.deepEqual(mapper.toDto({ remark: 'note' }), { remark: 'note' });
+		// Without the flag the key is copied through and present; under the flag a declared
+		// `undefined` is lifted into an omission. Both read back as undefined.
+		assert.equal(mapper.toDto({ remark: undefined }).remark, undefined);
+	});
+
+	test(`class targets keep the constructor default when a lifted value is absent (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`export class Dto { remark?: string = 'default'; }
+/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { remark: string | null }): Dto;
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert: an omitted class field retains whatever the constructor assigned.
+		assert.equal(mapper.toDto({ remark: null }).remark, 'default');
+		assert.equal(mapper.toDto({ remark: 'note' }).remark, 'note');
+	});
+
+	test(`rejects an optional source when the target has no room for absence (${eopt})`, (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { id?: string }): { id: string };
+}`,
+			options,
+		);
+
+		// Act & Assert
+		assert.throws(
+			() => generate(ts, f.project),
+			/make the target optional or allow null or undefined/,
+		);
+	});
+}
+
+test('lifts null to undefined and undefined to null for required targets', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { out: string | null; in: string | undefined }): { out: string | undefined; in: string | null };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ out: null, in: undefined }), { out: undefined, in: null });
+	assert.deepEqual(mapper.toDto({ out: 'a', in: 'b' }), { out: 'a', in: 'b' });
+});
+
+test('lifting preserves falsy values', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { n: number | null; s: string | null; b: boolean | null; g: bigint | null }): { n?: number; s?: string; b?: boolean; g?: bigint };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert: `??`, not `||` — zero, empty string and false are real values.
+	assert.deepEqual(mapper.toDto({ n: 0, s: '', b: false, g: 0n }), {
+		n: 0,
+		s: '',
+		b: false,
+		g: 0n,
+	});
+	assert.deepEqual(mapper.toDto({ n: null, s: null, b: null, g: null }), {});
+});
+
+test('lifts a nullable Date without copying the instance', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { submittedAt: Date | null }): { submittedAt?: Date };
+}`,
+	);
+	const submittedAt = new Date('2026-10-03T00:00:00.000Z');
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.equal(mapper.toDto({ submittedAt }).submittedAt, submittedAt);
+	assert.deepEqual(mapper.toDto({ submittedAt: null }), {});
+});
+
+test('lifts a nullable literal union', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { state: 'on' | 'off' | null }): { state: 'on' | 'off' | undefined };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ state: null }), { state: undefined });
+	assert.deepEqual(mapper.toDto({ state: 'on' }), { state: 'on' });
+});
+
+test('lifts a renamed field by reading the source name', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  /** @map target=name source=label */
+  abstract toDto(source: { label: string | null }): { name?: string };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ label: null }), {});
+	assert.deepEqual(mapper.toDto({ label: 'Outdoor' }), { name: 'Outdoor' });
+});
+
+test('lifts a source typed exactly null', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { remark: null }): { remark: string | undefined };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ remark: null }), { remark: undefined });
+});
+
+test('a converter overrides lifting and assigns its result as-is', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  /** @convert remark toUndefined */
+  abstract toDto(source: { remark: string | null }): { remark?: string };
+  protected toUndefined(value: string | null): string | undefined { return value ?? undefined; }
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert: unlike the lifted form, the key is present and undefined.
+	assert.deepEqual(mapper.toDto({ remark: null }), { remark: undefined });
+});
+
+for (const { name, source, target, expected } of [
+	{
+		name: 'lifting does not weaken payload type checking',
+		source: '{ id: number | null }',
+		target: '{ id: string | undefined }',
+		expected: /number \| null is not assignable to string \| undefined; add @convert/,
+	},
+	{
+		name: 'nullable arrays still need an explicit converter',
+		source: '{ items: string[] | null }',
+		target: '{ items?: string[] }',
+		expected: /nested-object\/array copying is disabled/,
+	},
+]) {
+	test(name, (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper { abstract toDto(source: ${source}): ${target}; }`,
+		);
+
+		// Act & Assert
+		assert.throws(() => generate(ts, f.project), expected);
+	});
+}

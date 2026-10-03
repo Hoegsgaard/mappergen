@@ -155,6 +155,7 @@ build transformation; calling it without transformation fails immediately.
 | Rule                                 | Behavior                                                              |
 | ------------------------------------ | --------------------------------------------------------------------- |
 | Same field name                      | Copy compatible scalar values automatically.                          |
+| Null/undefined mismatch              | Bridge it automatically when the underlying types match.              |
 | `@map target=name source=sensorName` | Rename a source field. Named arguments may appear in either order.    |
 | `@convert reading toNumber`          | Pass the source value to a concrete public/protected instance method. |
 | Both annotations                     | Rename first, then convert the selected source value.                 |
@@ -174,7 +175,31 @@ compatible unions of scalar types and built-in Date values can be copied directl
 Dates remain the same object reference. For nested objects and arrays, write an
 explicit converter that controls which nested fields are returned.
 
-Null and undefined must be compatible with the target or handled by a converter.
+### Null and undefined
+
+When the underlying types match, MapperGen bridges `null`/`undefined` differences
+itself; no converter is needed for a field that only changes how it spells "no value".
+A `string | null` source fills a `string | undefined` target, and an optional source
+fills a `string | null` target. The target type decides the result:
+
+| Target field                | Result for a missing source value                                     |
+| --------------------------- | --------------------------------------------------------------------- |
+| `note?: string`             | Omitted from the result.                                              |
+| `note: string \| undefined` | `undefined`.                                                          |
+| `note: string \| null`      | `null`.                                                               |
+| `note?: string \| null`     | `null` stays `null`; only an absent or `undefined` source is omitted. |
+
+Optional targets are omitted rather than assigned `undefined`, so the result is the
+same with and without `exactOptionalPropertyTypes`. Falsy values are preserved:
+`0`, `''`, `false` and `0n` are values, not absence.
+
+A target that allows neither `null`, `undefined` nor absence still fails the build —
+`string | null` into `string` has nowhere to put the missing case. Bridging also never
+weakens type checking: `number | null` into `string | undefined` still fails.
+
+`@convert` disables bridging for that field and assigns the converter's result as-is.
+Use it when you want an optional target set to `undefined` rather than omitted.
+
 Optional target fields still require a source. When both fields are optional and
 there is no converter, an absent source field is omitted from the result.
 
@@ -192,9 +217,10 @@ itself as the return type, rather than a type alias to the class.
 Class targets must be concrete and have a public constructor callable without
 arguments. Optional/default constructor parameters are allowed. Public data fields
 must be writable and still need source fields, even when initialized or optional.
-When an optional source field is absent and no converter is used, its matching
-optional target field retains the constructor's default. A present value, including
-an explicitly allowed `undefined`, is assigned normally.
+When no converter is used and the source value is absent — or is a `null`/`undefined`
+the field cannot hold — the matching optional target field retains the constructor's
+default rather than being overwritten. A real value is assigned normally, as is an
+`undefined` whose target type explicitly allows it.
 
 Constructor arguments, factories and assignment to readonly fields or accessors
 are unsupported. Constructors run before field assignment; they cannot validate
@@ -256,7 +282,8 @@ Unsupported features:
   on the mapper itself. Target classes can have constructors and inheritance as
   described [above](#class-instances).
 - Union, array, tuple, index-signature or callable types as the entire source/target.
-  Scalar unions such as `string | null` are supported as fields; nested objects and
+  Scalar unions such as `string | null` are supported as fields, and null/undefined
+  mismatches between source and target are bridged automatically; nested objects and
   array fields require explicit converters.
 - Automatic nested-object mapping, ignore rules, factories or async mapping.
 - TypeScript project references.
@@ -267,7 +294,11 @@ Unsupported features:
   file is included in the mapping project.
 - **Unmapped target field**: provide a same-name source field or an explicit `@map`.
   Optional targets still need a source.
-- **Incompatible field type**: add a typed conversion method and `@convert`.
+- **Incompatible field type**: the underlying types differ — add a typed conversion
+  method and `@convert`.
+- **Target has nowhere to put a missing value**: the source allows `null`/`undefined`
+  but the target does not. Make the target optional or add `| null`/`| undefined`,
+  or add a converter that supplies a fallback.
 - **Class target needs a runtime import**: replace `import type` with a regular
   import of the target class.
 
@@ -279,7 +310,7 @@ use Node's `--enable-source-maps` to resolve those locations in stack traces.
 
 The [basic mapper](https://github.com/Hoegsgaard/mappergen/blob/main/examples/basic/SensorMapping.ts)
 and its [usage](https://github.com/Hoegsgaard/mappergen/blob/main/examples/basic/main.ts)
-include nullable-field conversion and a class target. In a repository checkout,
+include automatic null lifting and a class target. In a repository checkout,
 run `npm ci` followed by `npm run check` to validate the example.
 
 See [CONTRIBUTING.md](https://github.com/Hoegsgaard/mappergen/blob/main/CONTRIBUTING.md)
