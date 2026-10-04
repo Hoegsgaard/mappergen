@@ -158,22 +158,82 @@ build transformation; calling it without transformation fails immediately.
 | Null/undefined mismatch              | Bridge it automatically when the underlying types match.              |
 | `@map target=name source=sensorName` | Rename a source field. Named arguments may appear in either order.    |
 | `@convert reading toNumber`          | Pass the source value to a concrete public/protected instance method. |
-| Both annotations                     | Rename first, then convert the selected source value.                 |
+| `@delegate placement toPlacement`    | Map the field with another abstract mapping method on the contract.   |
+| `@delegate owner Contract.method`    | Same, but the method lives on another `@mapper` contract.             |
+| `@map` with either                   | Rename first, then convert or delegate the selected source value.     |
 | Source-only field                    | Exclude it from the result.                                           |
 
-MapperGen processes only `@map` and `@convert` on mapping methods. Other tags,
-including JSDoc and custom documentation tags, are ignored. Misspelled tag names
+MapperGen processes only `@map`, `@convert` and `@delegate` on mapping methods. Other
+tags, including JSDoc and custom documentation tags, are ignored. Misspelled tag names
 such as `@maps` are therefore ignored too; recognized mapping rules still have
 their syntax, field names and converter types validated.
 
 Converters live on the mapper class. Their input and output types are validated.
 An unknown field, missing converter, duplicate rule or incompatible type fails the
-build with a source location. Field names in comments are not editor-aware.
+build with a source location. Field names in comments are not editor-aware. A field
+takes `@convert` or `@delegate`, never both.
 
 Only target fields are copied. Inherited data fields are supported. Primitive values,
 compatible unions of scalar types and built-in Date values can be copied directly.
-Dates remain the same object reference. For nested objects and arrays, write an
-explicit converter that controls which nested fields are returned.
+Dates remain the same object reference.
+
+### Nested objects
+
+A nested object field is mapped by `@delegate`, which points at another abstract mapping
+method — on this contract, or on another one in the project. The simplest form names a
+method on the same contract:
+
+```ts
+/** @mapper */
+export abstract class SensorMapping {
+	/** @delegate placement toPlacement */
+	abstract toDto(source: SensorRow): SensorDto;
+
+	abstract toPlacement(source: PlacementRow): PlacementDto;
+}
+```
+
+The nested mapping is generated and checked field by field, exactly like the outer one,
+so adding a field to `PlacementDto` fails the build instead of silently producing
+`undefined`. That is the difference from `@convert`: a handwritten converter is an escape
+hatch that MapperGen does not look inside.
+
+The delegate may be declared in any order relative to its caller, may serve several
+fields, and may be the mapping method itself for recursive structures. A delegation cycle
+must pass through an optional or nullable field, or it recurses forever.
+
+A delegate on **another contract** is named `Contract.method`, so a mapper you already use
+on its own can be reused instead of duplicated:
+
+```ts
+import { UserMapping } from './UserMapping.js';
+
+/** @mapper */
+export abstract class SensorMapping {
+	/** @delegate owner UserMapping.toDto */
+	abstract toDto(source: SensorRow): SensorDto;
+}
+```
+
+The named contract must be in scope, carry `@mapper`, be part of the same mapping project
+— otherwise it is never generated — and be imported at runtime rather than with
+`import type`. MapperGen calls it through its cached `getMapper` instance, so it behaves
+exactly as it does for its own callers.
+
+One wrinkle: TypeScript does not resolve names inside a JSDoc tag, so under
+`noUnusedLocals` your own `tsc` and editor report the import as unused even though the
+generated code needs it. The generated output itself stays clean. Use the contract
+somewhere in the file — `export const users = getMapper(UserMapping);` is usually
+wanted anyway — or silence it for that import.
+
+A delegate's parameter cannot be nullable — a mapping method's source must be a concrete
+object shape — so MapperGen bridges the empty case at the call site: `null`, `undefined`
+and absent values never reach the delegate, and the target decides what appears instead,
+following the table under [Null and undefined](#null-and-undefined). One difference from a
+direct copy: a delegated optional target is omitted even when it also allows `null`.
+
+Arrays still need a converter. It can call a delegated mapping method with `.map()`, which
+keeps the guarantee, because the wrapper itself contains no field assignments.
 
 ### Null and undefined
 
@@ -198,7 +258,10 @@ A target that allows neither `null`, `undefined` nor absence still fails the bui
 weakens type checking: `number | null` into `string | undefined` still fails.
 
 `@convert` disables bridging for that field and assigns the converter's result as-is.
-Use it when you want an optional target set to `undefined` rather than omitted.
+Use it when you want an optional target set to `undefined` rather than omitted. A
+handwritten converter receives the source value exactly as declared, nullable or not.
+`@delegate` is the opposite: bridging stays on, because a generated mapping method
+cannot accept `null` or `undefined`.
 
 Optional target fields still require a source. When both fields are optional and
 there is no converter, an absent source field is omitted from the result.
@@ -283,9 +346,10 @@ Unsupported features:
   described [above](#class-instances).
 - Union, array, tuple, index-signature or callable types as the entire source/target.
   Scalar unions such as `string | null` are supported as fields, and null/undefined
-  mismatches between source and target are bridged automatically; nested objects and
-  array fields require explicit converters.
-- Automatic nested-object mapping, ignore rules, factories or async mapping.
+  mismatches between source and target are bridged automatically; nested object fields
+  require `@delegate`, and array fields require a converter.
+- _Implicit_ nested-object mapping — delegation must be requested with `@delegate` —
+  plus ignore rules, factories and async mapping.
 - TypeScript project references.
 
 ## Troubleshooting and debugging
@@ -299,8 +363,18 @@ Unsupported features:
 - **Target has nowhere to put a missing value**: the source allows `null`/`undefined`
   but the target does not. Make the target optional or add `| null`/`| undefined`,
   or add a converter that supplies a fallback.
+- **Needs an explicit rule**: the field is a nested object or array. Add `@delegate` to
+  map it with another mapping method, or `@convert` for a handwritten conversion.
+- **Delegate is a concrete method / Converter is an abstract mapping method**: the two
+  tags are swapped. `@delegate` names an abstract mapping method; `@convert` names a
+  handwritten one.
+- **Delegate qualifier is not an `@mapper` contract in scope / is not part of the mapping
+  project**: `@delegate field Contract.method` needs `Contract` imported at runtime, marked
+  `@mapper`, and included by the mapping project so that it is generated too.
 - **Class target needs a runtime import**: replace `import type` with a regular
   import of the target class.
+- A contract reports one error at a time. Because delegation couples mapping methods,
+  fixing a nested mapping can reveal the next error in its caller, or the other way round.
 
 Source maps preserve handwritten converter locations. Generated method bodies map
 back to their abstract declarations. Enable source maps in production builds and
@@ -308,10 +382,12 @@ use Node's `--enable-source-maps` to resolve those locations in stack traces.
 
 ## Examples and contributing
 
-The [basic mapper](https://github.com/Hoegsgaard/mappergen/blob/main/examples/basic/SensorMapping.ts)
-and its [usage](https://github.com/Hoegsgaard/mappergen/blob/main/examples/basic/main.ts)
-include automatic null lifting and a class target. In a repository checkout,
-run `npm ci` followed by `npm run check` to validate the example.
+The [basic mapper](https://github.com/Hoegsgaard/mappergen/blob/main/examples/basic/SensorMapping.ts),
+the [contract it delegates to](https://github.com/Hoegsgaard/mappergen/blob/main/examples/basic/UserMapping.ts)
+and their [usage](https://github.com/Hoegsgaard/mappergen/blob/main/examples/basic/main.ts)
+include automatic null lifting, a class target and delegation within and across
+contracts. In a repository checkout, run `npm ci` followed by `npm run check` to
+validate the example.
 
 See [CONTRIBUTING.md](https://github.com/Hoegsgaard/mappergen/blob/main/CONTRIBUTING.md)
 for local development, tests and pull requests.

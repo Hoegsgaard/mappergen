@@ -1,9 +1,17 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync } from 'node:fs';
+import {
+	mkdtempSync,
+	mkdirSync,
+	symlinkSync,
+	writeFileSync,
+	readFileSync,
+	rmSync,
+	readdirSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { generate } from 'mappergen/compiler';
 
 import ts from '@typescript/typescript6';
@@ -121,7 +129,7 @@ export abstract class Mapper {
 	);
 
 	// Act & Assert
-	assert.throws(() => generate(ts, f.project), /nested-object\/array copying is disabled/);
+	assert.throws(() => generate(ts, f.project), /needs an explicit rule: add @delegate/);
 });
 
 for (const { name, converter, expected } of [
@@ -448,7 +456,7 @@ for (const { name, source, target, expected } of [
 		name: 'arrays need an explicit converter',
 		source: '{ items: string[] }',
 		target: '{ items: string[] }',
-		expected: /nested-object\/array copying is disabled/,
+		expected: /needs an explicit rule: add @delegate/,
 	},
 	{
 		name: 'nullable sources cannot fill non-nullable targets',
@@ -694,8 +702,7 @@ export abstract class Mapper {
 	assert.deepEqual(result, { name: 'Outdoor', reading: 12.5 });
 });
 
-// Automatic null/undefined lifting. Shapes whose emission depends on
-// exactOptionalPropertyTypes are exercised under both settings.
+// Automatic null/undefined lifting, under both exactOptionalPropertyTypes settings.
 for (const exactOptionalPropertyTypes of [false, true]) {
 	const eopt = `EOPT=${exactOptionalPropertyTypes}`;
 	const options = { exactOptionalPropertyTypes };
@@ -752,7 +759,7 @@ export abstract class Mapper {
 		// Act
 		const mapper = await execute(f);
 
-		// Assert: null stays null rather than collapsing into absence.
+		// Assert
 		assert.deepEqual(mapper.toDto({ remark: null }), { remark: null });
 		assert.deepEqual(mapper.toDto({ remark: 'note' }), { remark: 'note' });
 		// Without the flag this field is a plain copy, so the key is present and undefined;
@@ -797,7 +804,7 @@ export abstract class Mapper {
 		// Act
 		const mapper = await execute(f);
 
-		// Assert: an omitted class field retains whatever the constructor assigned.
+		// Assert
 		assert.equal(mapper.toDto({ remark: null }).remark, 'default');
 		assert.equal(mapper.toDto({ remark: 'note' }).remark, 'note');
 	});
@@ -950,7 +957,7 @@ export abstract class Mapper {
 	// Act
 	const mapper = await execute(f);
 
-	// Assert: unlike the lifted form, the key is present and undefined.
+	// Assert
 	assert.deepEqual(mapper.toDto({ remark: null }), { remark: undefined });
 });
 
@@ -965,7 +972,7 @@ for (const { name, source, target, expected } of [
 		name: 'nullable arrays still need an explicit converter',
 		source: '{ items: string[] | null }',
 		target: '{ items?: string[] }',
-		expected: /nested-object\/array copying is disabled/,
+		expected: /needs an explicit rule: add @delegate/,
 	},
 ]) {
 	test(name, (t) => {
@@ -980,3 +987,760 @@ export abstract class Mapper { abstract toDto(source: ${source}): ${target}; }`,
 		assert.throws(() => generate(ts, f.project), expected);
 	});
 }
+
+// Nested object mapping delegated to another abstract mapping method.
+const NESTED = `interface UserModel { id: string; firstName: string; secret: string }
+interface UserDto { id: string; firstName: string }`;
+
+for (const exactOptionalPropertyTypes of [false, true]) {
+	const eopt = `EOPT=${exactOptionalPropertyTypes}`;
+	const options = { exactOptionalPropertyTypes };
+	const user = { id: 'u1', firstName: 'Ada', secret: 'hidden' };
+
+	test(`delegates a nullable nested field to an optional target (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { id: string; assignee: UserModel | null }): { id: string; assignee?: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toOutput({ id: 'e1', assignee: null }), { id: 'e1' });
+		assert.deepEqual(mapper.toOutput({ id: 'e1', assignee: user }), {
+			id: 'e1',
+			assignee: { id: 'u1', firstName: 'Ada' },
+		});
+	});
+
+	test(`delegates a nullable nested field to a required undefined target (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel | null }): { assignee: UserDto | undefined };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toOutput({ assignee: null }), { assignee: undefined });
+		assert.deepEqual(mapper.toOutput({ assignee: user }), {
+			assignee: { id: 'u1', firstName: 'Ada' },
+		});
+	});
+
+	test(`delegates a nullable nested field to a nullable target (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel | null }): { assignee: UserDto | null };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toOutput({ assignee: null }), { assignee: null });
+		assert.deepEqual(mapper.toOutput({ assignee: user }), {
+			assignee: { id: 'u1', firstName: 'Ada' },
+		});
+	});
+
+	test(`delegates an optional nested source field (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee?: UserModel }): { assignee?: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toOutput({}), {});
+		assert.deepEqual(mapper.toOutput({ assignee: user }), {
+			assignee: { id: 'u1', firstName: 'Ada' },
+		});
+	});
+
+	test(`class targets keep the constructor default when a delegated value is null (${eopt})`, async (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`${NESTED}
+export class Nested { id!: string; firstName!: string }
+export class Out { assignee?: Nested = undefined; }
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel | null }): Out;
+  abstract toAssignee(source: UserModel): Nested;
+}`,
+			options,
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.equal(mapper.toOutput({ assignee: null }).assignee, undefined);
+		assert.deepEqual(
+			{ ...mapper.toOutput({ assignee: user }).assignee },
+			{
+				id: 'u1',
+				firstName: 'Ada',
+			},
+		);
+	});
+
+	test(`reports an optional source a converter cannot accept (${eopt})`, (t) => {
+		// Arrange
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper {
+  /** @convert note upper */
+  abstract toDto(source: { note?: string }): { note: string };
+  protected upper(value: string): string { return value.toUpperCase(); }
+}`,
+			options,
+		);
+
+		// Act & Assert: without the flag the symbol type keeps `| undefined`; with it the
+		// read type has to be reconstructed, or this surfaces as a raw TS2345 instead.
+		assert.throws(
+			() => generate(ts, f.project),
+			/Converter 'upper' cannot accept field 'note' \(string \| undefined\)/,
+		);
+	});
+}
+
+test('a delegated nested mapping still requires a source for every nested target field', (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel | null }): { assignee?: { id: string; email: string } };
+  abstract toAssignee(source: UserModel): { id: string; email: string };
+}`,
+	);
+
+	// Act & Assert
+	assert.throws(() => generate(ts, f.project), /Unmapped target 'email'/);
+});
+
+test('delegation produces a new nested object rather than sharing the source', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+	);
+	const assignee = { id: 'u1', firstName: 'Ada', secret: 'hidden' };
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toOutput({ assignee });
+
+	// Assert
+	assert.deepEqual(result, { assignee: { id: 'u1', firstName: 'Ada' } });
+	assert.notEqual(result.assignee, assignee);
+});
+
+test('a delegate may be declared before its caller', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  abstract toAssignee(source: UserModel): UserDto;
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toOutput({ assignee: { id: 'u1', firstName: 'Ada', secret: 'x' } }), {
+		assignee: { id: 'u1', firstName: 'Ada' },
+	});
+});
+
+test('a renamed field can be delegated, and one delegate can serve several fields', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /**
+   * @map target=owner source=assignee
+   * @delegate owner toUser
+   * @delegate reviewer toUser
+   */
+  abstract toOutput(source: { assignee: UserModel; reviewer: UserModel }): { owner: UserDto; reviewer: UserDto };
+  abstract toUser(source: UserModel): UserDto;
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toOutput({
+		assignee: { id: 'u1', firstName: 'Ada', secret: 'x' },
+		reviewer: { id: 'u2', firstName: 'Grace', secret: 'y' },
+	});
+
+	// Assert
+	assert.deepEqual(result, {
+		owner: { id: 'u1', firstName: 'Ada' },
+		reviewer: { id: 'u2', firstName: 'Grace' },
+	});
+});
+
+test('a mapping method can delegate to itself for recursive structures', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`interface Node { id: string; parent: Node | null }
+interface NodeDto { id: string; parent?: NodeDto }
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate parent toNode */
+  abstract toNode(source: Node): NodeDto;
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toNode({ id: 'child', parent: { id: 'root', parent: null } });
+
+	// Assert
+	assert.deepEqual(result, { id: 'child', parent: { id: 'root' } });
+});
+
+test('two mapping methods can delegate to each other', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`interface A { id: string; b: B | null }
+interface B { name: string; a: A | null }
+interface ADto { id: string; b?: BDto }
+interface BDto { name: string; a?: ADto }
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate b toB */
+  abstract toA(source: A): ADto;
+  /** @delegate a toA */
+  abstract toB(source: B): BDto;
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toA({ id: '1', b: { name: 'x', a: null } });
+
+	// Assert
+	assert.deepEqual(result, { id: '1', b: { name: 'x' } });
+});
+
+test('a handwritten converter can map an array through a generated mapping method', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @convert users toUsers */
+  abstract toOutput(source: { users: UserModel[] }): { users: UserDto[] };
+  abstract toUser(source: UserModel): UserDto;
+  protected toUsers(users: UserModel[]): UserDto[] { return users.map((user) => this.toUser(user)); }
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toOutput({ users: [{ id: 'u1', firstName: 'Ada', secret: 'x' }] }), {
+		users: [{ id: 'u1', firstName: 'Ada' }],
+	});
+});
+
+test('an overloaded converter still resolves to its implementation', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  /** @convert reading convert */
+  abstract toDto(source: { reading: string }): { reading: number };
+  protected convert(value: string): number;
+  protected convert(value: number): number;
+  protected convert(value: string | number): number { return Number(value); }
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ reading: '12.5' }), { reading: 12.5 });
+});
+
+for (const { name, contract, expected } of [
+	{
+		name: 'rejects @delegate pointing at a concrete method',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+  protected toAssignee(value: UserModel): UserDto { return { id: value.id, firstName: value.firstName }; }
+}`,
+		expected: /Delegate 'toAssignee' is a concrete method; use @convert/,
+	},
+	{
+		name: 'rejects @convert pointing at an abstract mapping method',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @convert assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+		expected: /Converter 'toAssignee' is an abstract mapping method; use @delegate/,
+	},
+	{
+		name: 'rejects @delegate naming a method that does not exist',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee missing */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+}`,
+		expected: /Delegate 'missing' must be an abstract mapping method on the same contract/,
+	},
+	{
+		name: 'rejects @delegate naming a method on another contract',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Other {
+  abstract toAssignee(source: UserModel): UserDto;
+}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+}`,
+		expected: /Delegate 'toAssignee' must be an abstract mapping method on the same contract/,
+	},
+	{
+		name: 'rejects a protected delegate',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+  protected abstract toAssignee(source: UserModel): UserDto;
+}`,
+		expected: /must be a public abstract mapping method/,
+	},
+	{
+		name: 'rejects a delegate that cannot accept the field',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: { other: string } }): { assignee: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+		expected: /Delegate 'toAssignee' cannot accept field 'assignee'/,
+	},
+	{
+		name: 'rejects a delegate that cannot produce the target',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: { other: string } };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+		expected: /Delegate 'toAssignee' cannot produce target 'assignee'/,
+	},
+	{
+		name: 'rejects a nullable delegated field when the target has no room for absence',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee toAssignee */
+  abstract toOutput(source: { assignee: UserModel | null }): { assignee: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+		expected: /'toAssignee' cannot receive UserModel \| null; make the target optional/,
+	},
+	{
+		name: 'rejects an array field delegated to an element mapping method',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate users toUser */
+  abstract toOutput(source: { users: UserModel[] }): { users: UserDto[] };
+  abstract toUser(source: UserModel): UserDto;
+}`,
+		expected: /Delegate 'toUser' cannot accept field 'users' \(UserModel\[\]\)/,
+	},
+	{
+		name: 'rejects a field carrying both @convert and @delegate',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /**
+   * @delegate assignee toAssignee
+   * @convert assignee other
+   */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+  protected other(value: UserModel): UserDto { return { id: value.id, firstName: value.firstName }; }
+}`,
+		expected: /Field 'assignee' cannot have both @convert and @delegate/,
+	},
+	{
+		name: 'rejects @delegate with a malformed argument list',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate assignee */
+  abstract toOutput(source: { assignee: UserModel }): { assignee: UserDto };
+  abstract toAssignee(source: UserModel): UserDto;
+}`,
+		expected: /Expected @delegate targetField mappingMethod/,
+	},
+]) {
+	test(name, (t) => {
+		// Arrange
+		const f = fixture(t, contract);
+
+		// Act & Assert
+		assert.throws(() => generate(ts, f.project), expected);
+	});
+}
+
+// Delegating to a mapping method on another contract, qualified as Contract.method.
+const packageRoot = dirname(dirname(fileURLToPath(new URL('../dist/runtime.js', import.meta.url))));
+
+// Unlike fixture(), this links the package: a cross-contract delegate makes the
+// generator inject an import of `mappergen`, which then has to resolve.
+function contracts(
+	t: TestContext,
+	files: Record<string, string>,
+	compilerOptions: Record<string, unknown> = {},
+) {
+	const dir = mkdtempSync(join(tmpdir(), 'mappergen-cross-'));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	mkdirSync(join(dir, 'node_modules'));
+	symlinkSync(packageRoot, join(dir, 'node_modules/mappergen'), 'junction');
+	writeFileSync(join(dir, 'package.json'), '{"type":"module"}');
+	const project = join(dir, 'tsconfig.json');
+	writeFileSync(
+		project,
+		JSON.stringify({
+			compilerOptions: {
+				strict: true,
+				target: 'ES2022',
+				module: 'NodeNext',
+				moduleResolution: 'NodeNext',
+				types: [],
+				outDir: 'dist',
+				...compilerOptions,
+			},
+			include: ['*.ts'],
+		}),
+	);
+	for (const [name, source] of Object.entries(files)) {
+		mkdirSync(dirname(join(dir, name)), { recursive: true });
+		writeFileSync(join(dir, name), source);
+	}
+	return { dir, project };
+}
+
+async function executeFile(f: { dir: string; project: string }, emitted: string) {
+	const parsed = ts.parseJsonConfigFileContent(
+		ts.readConfigFile(f.project, ts.sys.readFile).config,
+		ts.sys,
+		f.dir,
+	);
+	const compiled = generate(ts, f.project);
+	const host = ts.createCompilerHost(parsed.options);
+	const read = host.readFile.bind(host);
+	host.readFile = (file) => compiled.get(resolve(file)) ?? read(file);
+	const program = ts.createProgram(parsed.fileNames, parsed.options, host);
+	assert.equal(ts.getPreEmitDiagnostics(program).length, 0);
+	assert.equal(program.emit().emitSkipped, false);
+	return import(pathToFileURL(join(f.dir, 'dist', emitted)).href);
+}
+
+const USER_CONTRACT = `export interface UserModel { id: string; firstName: string; secret: string }
+export class UserPublicModel { id!: string; firstName!: string }
+/** @mapper */
+export abstract class UserMapping {
+  abstract toUser(source: UserModel): UserPublicModel;
+}`;
+
+test('delegates to a contract in another file that stays usable on its own', async (t) => {
+	// Arrange
+	const f = contracts(t, {
+		'User.ts': USER_CONTRACT,
+		'Sensor.ts': `import { getMapper } from 'mappergen';
+import { UserMapping, type UserModel, UserPublicModel } from './User.js';
+export class SensorDto { id!: string; owner?: UserPublicModel }
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { id: string; owner: UserModel | null }): SensorDto;
+}
+export const sensors = getMapper(SensorMapping);
+export const users = getMapper(UserMapping);
+export { UserPublicModel };`,
+	});
+	const owner = { id: 'u1', firstName: 'Ada', secret: 'hidden' };
+
+	// Act
+	const module = await executeFile(f, 'Sensor.js');
+
+	// Assert
+	const nested = module.sensors.toDto({ id: 's1', owner });
+	assert.equal(nested.id, 's1');
+	assert.ok(nested.owner instanceof module.UserPublicModel);
+	assert.deepEqual({ ...nested.owner }, { id: 'u1', firstName: 'Ada' });
+	assert.deepEqual(
+		{ ...module.sensors.toDto({ id: 's1', owner: null }) },
+		{
+			id: 's1',
+			owner: undefined,
+		},
+	);
+	assert.deepEqual({ ...module.users.toUser(owner) }, { id: 'u1', firstName: 'Ada' });
+});
+
+test('delegates to another contract declared in the same file', async (t) => {
+	// Arrange
+	const f = contracts(t, {
+		'Contract.ts': `import { getMapper } from 'mappergen';
+${USER_CONTRACT}
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}
+export const sensors = getMapper(SensorMapping);`,
+	});
+
+	// Act
+	const module = await executeFile(f, 'Contract.js');
+	const result = module.sensors.toDto({
+		owner: { id: 'u1', firstName: 'Ada', secret: 'hidden' },
+	});
+
+	// Assert
+	assert.deepEqual({ ...result.owner }, { id: 'u1', firstName: 'Ada' });
+});
+
+test('a qualifier naming the contract itself resolves to this', async (t) => {
+	// Arrange
+	const f = contracts(t, {
+		'Contract.ts': `import { getMapper } from 'mappergen';
+interface Node { id: string; parent: Node | null }
+interface NodeDto { id: string; parent?: NodeDto }
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate parent Mapper.toNode */
+  abstract toNode(source: Node): NodeDto;
+}
+export const mapper = getMapper(Mapper);`,
+	});
+
+	// Act
+	const module = await executeFile(f, 'Contract.js');
+
+	// Assert
+	assert.deepEqual(module.mapper.toNode({ id: 'child', parent: { id: 'root', parent: null } }), {
+		id: 'child',
+		parent: { id: 'root' },
+	});
+});
+
+test('a cross-contract delegate still requires a source for every nested target field', (t) => {
+	// Arrange
+	const f = contracts(t, {
+		'User.ts': `export interface UserModel { id: string; firstName: string }
+export class UserPublicModel { id!: string; firstName!: string; email!: string }
+/** @mapper */
+export abstract class UserMapping {
+  abstract toUser(source: UserModel): UserPublicModel;
+}`,
+		'Sensor.ts': `import { UserMapping, type UserModel, UserPublicModel } from './User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}`,
+	});
+
+	// Act & Assert
+	assert.throws(() => generate(ts, f.project), /Unmapped target 'email'/);
+});
+
+for (const { name, files, expected } of [
+	{
+		name: 'rejects a qualifier that is not a mapper contract',
+		files: {
+			'Contract.ts': `class Helper { static x = 1 }
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate owner Helper.toUser */
+  abstract toDto(source: { owner: { id: string } }): { owner: { id: string } };
+}`,
+		},
+		expected: /'Helper' must be an @mapper contract in scope/,
+	},
+	{
+		name: 'rejects an unknown qualifier',
+		files: {
+			'Contract.ts': `/** @mapper */
+export abstract class Mapper {
+  /** @delegate owner Missing.toUser */
+  abstract toDto(source: { owner: { id: string } }): { owner: { id: string } };
+}`,
+		},
+		expected: /'Missing' must be an @mapper contract in scope/,
+	},
+	{
+		name: 'rejects a type-only import of the delegate contract',
+		files: {
+			'User.ts': USER_CONTRACT,
+			'Sensor.ts': `import type { UserMapping } from './User.js';
+import type { UserModel, UserPublicModel } from './User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}`,
+		},
+		expected: /needs a runtime import of 'UserMapping'/,
+	},
+	{
+		name: 'rejects a delegate contract outside the mapping project',
+		files: {
+			'lib/User.ts': USER_CONTRACT,
+			'Sensor.ts': `import { UserMapping, type UserModel, UserPublicModel } from './lib/User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}`,
+		},
+		expected: /'UserMapping' is not part of the mapping project, so it is never generated/,
+	},
+	{
+		name: 'rejects a method missing from the named contract',
+		files: {
+			'Contract.ts': `${USER_CONTRACT}
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.missing */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}`,
+		},
+		expected: /Delegate 'UserMapping.missing' must be an abstract mapping method on 'UserMapping'/,
+	},
+	{
+		name: 'rejects a delegate name with too many qualifiers',
+		files: {
+			'Contract.ts': `${USER_CONTRACT}
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner a.b.c */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}`,
+		},
+		expected: /must name a mapping method, optionally qualified as Contract\.method/,
+	},
+]) {
+	test(name, (t) => {
+		// Arrange
+		const f = contracts(t, files);
+
+		// Act & Assert
+		assert.throws(() => generate(ts, f.project), expected);
+	});
+}
+
+test('an injected runtime import is used, so generated output survives noUnusedLocals', async (t) => {
+	// Arrange
+	const f = contracts(
+		t,
+		{
+			'User.ts': USER_CONTRACT,
+			'Sensor.ts': `import { getMapper } from 'mappergen';
+import { UserMapping, type UserModel, UserPublicModel } from './User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}
+export const sensors = getMapper(SensorMapping);`,
+		},
+		{ noUnusedLocals: true },
+	);
+
+	// Act
+	const module = await executeFile(f, 'Sensor.js');
+	const result = module.sensors.toDto({
+		owner: { id: 'u1', firstName: 'Ada', secret: 'hidden' },
+	});
+
+	// Assert
+	assert.deepEqual({ ...result.owner }, { id: 'u1', firstName: 'Ada' });
+});

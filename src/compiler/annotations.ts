@@ -1,6 +1,6 @@
 /** Parse one annotation without depending on the TypeScript compiler. */
 export function parseFieldRule(
-	tagName: 'map' | 'convert',
+	tagName: 'map' | 'convert' | 'delegate',
 	comment: string,
 ): { key: string; value: string } {
 	if (tagName === 'map') {
@@ -22,7 +22,11 @@ export function parseFieldRule(
 
 	const parts = comment.split(/\s+/);
 	if (parts.length !== 2 || !parts[0] || !parts[1]) {
-		throw new Error('Expected @convert targetField converterMethod.');
+		throw new Error(
+			tagName === 'delegate'
+				? 'Expected @delegate targetField mappingMethod.'
+				: 'Expected @convert targetField converterMethod.',
+		);
 	}
 
 	return { key: parts[0], value: parts[1] };

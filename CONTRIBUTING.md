@@ -80,7 +80,7 @@ releases are managed by the project maintainer.
 - `src/cli.ts`: command-line validation.
 - `test/`: compiler, diagnostics, runtime, CLI, source map and integration tests.
   `api.types.ts` checks the emitted public declarations during test compilation.
-- `examples/basic/`: one mapper and its usage.
+- `examples/basic/`: two mappers, one delegating to the other, and their usage.
 
 `tsconfig.json` provides shared strict rules and the editor project for source and
 tests. `tsconfig.build.json` emits the library into `dist/`, including declarations

@@ -18,6 +18,7 @@ interface SourceEdit {
 interface FieldRule {
 	map?: string;
 	convert?: string;
+	delegate?: string;
 }
 
 export interface GeneratedMapper {
@@ -79,6 +80,9 @@ export function generateWithMaps(
 	const mapped = new Map<string, GeneratedMapper>();
 	const errors: string[] = [];
 	const edits = new Map<string, SourceEdit[]>();
+	const needsRuntime = new Set<string>();
+	// Aliased so an injected import cannot shadow or collide with handwritten names.
+	const runtime = '__mappergenGetMapper';
 
 	function fail(node: TypeScript.Node, message: string): never {
 		const file = node.getSourceFile();
@@ -339,7 +343,7 @@ export function generateWithMaps(
 					const rules = new Map<string, FieldRule>();
 					for (const tag of tags(method)) {
 						const tagName = tag.tagName.text;
-						if (tagName !== 'map' && tagName !== 'convert') continue;
+						if (tagName !== 'map' && tagName !== 'convert' && tagName !== 'delegate') continue;
 
 						let parsedRule: ReturnType<typeof parseFieldRule>;
 						try {
@@ -355,6 +359,8 @@ export function generateWithMaps(
 						const rule = rules.get(key) ?? {};
 						if (rule[tagName]) fail(tag, `Duplicate @${tagName} for '${key}'.`);
 						rule[tagName] = value;
+						if (rule.convert && rule.delegate)
+							fail(tag, `Field '${key}' cannot have both @convert and @delegate.`);
 						rules.set(key, rule);
 					}
 
@@ -381,10 +387,163 @@ export function generateWithMaps(
 						const access = `source[${JSON.stringify(sourceName)}]`;
 						const sourceOptional = Boolean(sourceProperty.flags & ts.SymbolFlags.Optional);
 						const targetOptional = Boolean(property.flags & ts.SymbolFlags.Optional);
+						// Reading an optional property yields `T | undefined`, even under
+						// exactOptionalPropertyTypes, where the symbol type drops that member.
+						const readType = sourceOptional
+							? checker.getNullableType(sourceType, ts.TypeFlags.Undefined)
+							: sourceType;
+						const targetNull = hasFlag(targetType, ts.TypeFlags.Null);
+						const targetUndefined = hasFlag(targetType, ts.TypeFlags.Undefined);
 						let expression = access;
-						// Emit the field conditionally; only the direct-copy path sets a guard.
+						// When set, the field is emitted conditionally rather than assigned.
 						let guard: string | undefined;
-						if (rule.convert) {
+
+						// Optional targets are omitted rather than assigned, so the result does not
+						// depend on exactOptionalPropertyTypes; a required key cannot be omitted.
+						const lift = (
+							present: string,
+							build: (empty: string) => string,
+							reason: string,
+						): void => {
+							if (targetOptional) guard = present;
+							else if (targetUndefined) expression = build('undefined');
+							else if (targetNull) expression = build('null');
+							else
+								fail(
+									method,
+									`Field '${property.name}': ${reason}; make the target optional or allow null or undefined, or add @convert.`,
+								);
+						};
+
+						if (rule.delegate) {
+							// `Contract.method` reaches another @mapper; a bare name stays local.
+							const parts = rule.delegate.split('.');
+							if (parts.length > 2 || parts.some((part) => !part))
+								fail(
+									method,
+									`Delegate '${rule.delegate}' must name a mapping method, optionally qualified as Contract.method.`,
+								);
+							const [qualifier, memberName] =
+								parts.length === 2 ? [parts[0], parts[1]] : [undefined, parts[0]];
+
+							let owner: TypeScript.ClassDeclaration = mapperClass;
+							if (qualifier && qualifier !== name) {
+								const alias = checker.resolveName(
+									qualifier,
+									method,
+									ts.SymbolFlags.Class | ts.SymbolFlags.Alias,
+									false,
+								);
+								const symbol =
+									alias && alias.flags & ts.SymbolFlags.Alias
+										? checker.getAliasedSymbol(alias)
+										: alias;
+								const declaration = symbol?.declarations?.find(ts.isClassDeclaration);
+								if (!declaration || !tags(declaration).some((t) => t.tagName.text === 'mapper'))
+									fail(
+										method,
+										`Delegate '${rule.delegate}': '${qualifier}' must be an @mapper contract in scope.`,
+									);
+								// A type-only import leaves nothing to call at runtime.
+								for (const imported of alias?.declarations ?? []) {
+									let node: TypeScript.Node | undefined = imported;
+									while (node && !ts.isSourceFile(node)) {
+										if (
+											(ts.isImportClause(node) ||
+												ts.isImportSpecifier(node) ||
+												ts.isImportEqualsDeclaration(node)) &&
+											node.isTypeOnly
+										)
+											fail(
+												method,
+												`Delegate '${rule.delegate}' needs a runtime import of '${qualifier}'. Replace import type with a regular import.`,
+											);
+										node = node.parent;
+									}
+								}
+								// Only a contract the build generates ever receives its marker.
+								if (!roots.includes(declaration.getSourceFile().fileName))
+									fail(
+										method,
+										`Delegate '${rule.delegate}': '${qualifier}' is not part of the mapping project, so it is never generated.`,
+									);
+								owner = declaration;
+							}
+
+							// Only abstract methods qualify; those are the ones the build generates.
+							const delegate = owner.members.find(
+								(m): m is TypeScript.MethodDeclaration =>
+									ts.isMethodDeclaration(m) &&
+									ts.isIdentifier(m.name) &&
+									m.name.text === memberName &&
+									hasModifier(m, ts.SyntaxKind.AbstractKeyword),
+							);
+							if (!delegate) {
+								const concrete = owner.members.some(
+									(m) =>
+										ts.isMethodDeclaration(m) &&
+										ts.isIdentifier(m.name) &&
+										m.name.text === memberName &&
+										!!m.body,
+								);
+								fail(
+									method,
+									concrete
+										? `Delegate '${rule.delegate}' is a concrete method; use @convert for handwritten conversions.`
+										: `Delegate '${rule.delegate}' must be an abstract mapping method on ${owner === mapperClass ? 'the same contract' : `'${qualifier}'`}.`,
+								);
+							}
+							if (
+								hasModifier(delegate, ts.SyntaxKind.ProtectedKeyword) ||
+								hasModifier(delegate, ts.SyntaxKind.PrivateKeyword)
+							) {
+								fail(
+									method,
+									`Delegate '${rule.delegate}' must be a public abstract mapping method on the same contract.`,
+								);
+							}
+
+							const delegation = checker.getSignatureFromDeclaration(delegate);
+							if (!delegation) fail(delegate, 'Unable to resolve delegate signature.');
+
+							// A generated mapping method cannot declare a nullable parameter, so
+							// the call site drops the empty case instead of passing it on.
+							const input = checker.getNonNullableType(readType);
+							if (
+								delegation.parameters.length !== 1 ||
+								!checker.isTypeAssignableTo(input, getSymbolType(delegation.parameters[0]))
+							) {
+								fail(
+									method,
+									`Delegate '${rule.delegate}' cannot accept field '${sourceName}' (${checker.typeToString(input)}).`,
+								);
+							}
+
+							const delegated = checker.getReturnTypeOfSignature(delegation);
+							if (
+								isUnsupportedType(delegated) ||
+								!checker.isTypeAssignableTo(delegated, targetType)
+							)
+								fail(
+									method,
+									`Delegate '${rule.delegate}' cannot produce target '${property.name}' (${checker.typeToString(targetType)}).`,
+								);
+
+							// Another contract is reached through its cached instance, not `this`.
+							let receiver = 'this';
+							if (owner !== mapperClass) {
+								needsRuntime.add(file.fileName);
+								receiver = `${runtime}(${qualifier})`;
+							}
+							const call = `${receiver}.${memberName}(${access})`;
+							expression = call;
+							if (hasFlag(readType, ts.TypeFlags.Null) || hasFlag(readType, ts.TypeFlags.Undefined))
+								lift(
+									`${access} != null`,
+									(empty) => `${access} != null ? ${call} : ${empty}`,
+									`'${rule.delegate}' cannot receive ${checker.typeToString(readType)}`,
+								);
+						} else if (rule.convert) {
 							const converter = mapperClass.members.find(
 								(m): m is TypeScript.MethodDeclaration =>
 									ts.isMethodDeclaration(m) &&
@@ -398,21 +557,31 @@ export function generateWithMaps(
 								hasModifier(converter, ts.SyntaxKind.StaticKeyword) ||
 								converter.typeParameters?.length
 							) {
+								const abstract = mapperClass.members.some(
+									(m) =>
+										ts.isMethodDeclaration(m) &&
+										ts.isIdentifier(m.name) &&
+										m.name.text === rule.convert &&
+										hasModifier(m, ts.SyntaxKind.AbstractKeyword),
+								);
 								fail(
 									method,
-									`Converter '${rule.convert}' must be a concrete public/protected instance method on the contract.`,
+									abstract
+										? `Converter '${rule.convert}' is an abstract mapping method; use @delegate to generate the nested mapping.`
+										: `Converter '${rule.convert}' must be a concrete public/protected instance method on the contract.`,
 								);
 							}
 
 							const conversion = checker.getSignatureFromDeclaration(converter);
 							if (!conversion) fail(converter, 'Unable to resolve converter signature.');
+							// Handwritten converters stay exact: the field is passed as declared.
 							if (
 								conversion.parameters.length !== 1 ||
-								!checker.isTypeAssignableTo(sourceType, getSymbolType(conversion.parameters[0]))
+								!checker.isTypeAssignableTo(readType, getSymbolType(conversion.parameters[0]))
 							) {
 								fail(
 									method,
-									`Converter '${rule.convert}' cannot accept field '${sourceName}' (${checker.typeToString(sourceType)}).`,
+									`Converter '${rule.convert}' cannot accept field '${sourceName}' (${checker.typeToString(readType)}).`,
 								);
 							}
 
@@ -431,16 +600,8 @@ export function generateWithMaps(
 							if (!canCopyDirectly(sourceType) || !canCopyDirectly(targetType))
 								fail(
 									method,
-									`Field '${property.name}' needs an explicit converter: automatic nested-object/array copying is disabled.`,
+									`Field '${property.name}' needs an explicit rule: add @delegate to map it with another mapping method, or @convert for a handwritten conversion.`,
 								);
-
-							// Reading an optional property yields `T | undefined`, even under
-							// exactOptionalPropertyTypes, where the symbol type drops that member.
-							const readType = sourceOptional
-								? checker.getNullableType(sourceType, ts.TypeFlags.Undefined)
-								: sourceType;
-							const targetNull = hasFlag(targetType, ts.TypeFlags.Null);
-							const targetUndefined = hasFlag(targetType, ts.TypeFlags.Undefined);
 
 							// Compare payloads; null/undefined differences are lifted below, not rejected.
 							if (
@@ -462,21 +623,14 @@ export function generateWithMaps(
 								!targetUndefined &&
 								!(targetOptional && absenceOnly);
 
-							if (liftNull || liftUndefined) {
-								// Optional targets are omitted rather than assigned, so the result does
-								// not depend on exactOptionalPropertyTypes. A required key cannot be
-								// omitted, so it coalesces to whichever empty value the target allows.
-								if (targetOptional) guard = `${access} ${targetNull ? '!== undefined' : '!= null'}`;
-								else if (targetUndefined) expression = `${access} ?? undefined`;
-								else if (targetNull) expression = `${access} ?? null`;
-								else
-									fail(
-										method,
-										`Field '${property.name}': ${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}; make the target optional or allow null or undefined, or add @convert.`,
-									);
-							} else if (targetOptional && sourceOptional) {
+							if (liftNull || liftUndefined)
+								lift(
+									`${access} ${targetNull ? '!== undefined' : '!= null'}`,
+									(empty) => `${access} ?? ${empty}`,
+									`${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}`,
+								);
+							else if (targetOptional && sourceOptional)
 								guard = `${JSON.stringify(sourceName)} in source`;
-							}
 						}
 
 						if (constructor) {
@@ -524,6 +678,13 @@ export function generateWithMaps(
 	for (const [file, changes] of edits) {
 		const sourceFile = program.getSourceFile(file);
 		if (!sourceFile) throw new Error(`Cannot resolve source file: ${file}`);
+
+		if (needsRuntime.has(file))
+			changes.push({
+				start: 0,
+				end: 0,
+				text: `import { getMapper as ${runtime} } from 'mappergen';\n`,
+			});
 
 		const content = new MagicString(sourceFile.text);
 		for (const edit of changes.sort((a, b) => b.start - a.start)) {
