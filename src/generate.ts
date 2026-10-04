@@ -81,8 +81,11 @@ export function generateWithMaps(
 	const errors: string[] = [];
 	const edits = new Map<string, SourceEdit[]>();
 	const needsRuntime = new Set<string>();
-	// Delegated contracts the generated code imports itself: file -> exported name -> import.
-	const needsContract = new Map<string, Map<string, { alias: string; specifier: string }>>();
+	// Delegated contracts the generated code imports itself: file -> qualifier -> import.
+	const needsContract = new Map<
+		string,
+		Map<string, { alias: string; exported: string; specifier: string }>
+	>();
 	// Aliased so an injected import cannot shadow or collide with handwritten names.
 	const runtime = '__mappergenGetMapper';
 
@@ -138,6 +141,7 @@ export function generateWithMaps(
 	function referenceContract(
 		from: TypeScript.SourceFile,
 		contract: TypeScript.ClassDeclaration,
+		qualifier: string,
 		exported: string,
 	): string {
 		// Module resolution substitutes the source extension, so the output one is emitted.
@@ -148,11 +152,13 @@ export function generateWithMaps(
 			.replace(/\.mts$/, '.mjs')
 			.replace(/\.cts$/, '.cjs');
 
-		const alias = `__mappergen${exported}`;
-		// Keyed by name, so several fields delegating to one contract share the import.
+		// Keyed by the qualifier: unique within the file, where a class name is not —
+		// two files may export contracts of the same name, imported under local aliases.
+		const alias = `__mappergenContract${qualifier}`;
 		const imports = needsContract.get(from.fileName) ?? new Map();
-		imports.set(exported, {
+		imports.set(qualifier, {
 			alias,
+			exported,
 			specifier: JSON.stringify(path.startsWith('.') ? path : `./${path}`),
 		});
 		needsContract.set(from.fileName, imports);
@@ -515,7 +521,7 @@ export function generateWithMaps(
 									// An erased import leaves nothing to call, so generate one instead.
 									// The contract is imported under the name it exports, not a local alias.
 									if (isTypeOnly(alias))
-										reference = referenceContract(file, declaration, symbol.name);
+										reference = referenceContract(file, declaration, qualifier, symbol.name);
 								} else {
 									const candidates = contractsByName.get(qualifier) ?? [];
 									if (candidates.length > 1)
@@ -532,7 +538,8 @@ export function generateWithMaps(
 											`Delegate '${rule.delegate}': '${qualifier}' must be an @mapper contract in scope or in the mapping project.`,
 										);
 									owner = found;
-									reference = referenceContract(file, found, qualifier);
+									// Looked up by name, so the qualifier is the exported name.
+									reference = referenceContract(file, found, qualifier, qualifier);
 								}
 							}
 
@@ -752,7 +759,7 @@ export function generateWithMaps(
 				text: `import { getMapper as ${runtime} } from 'mappergen';\n`,
 			});
 
-		for (const [exported, { alias, specifier }] of needsContract.get(file) ?? [])
+		for (const { alias, exported, specifier } of needsContract.get(file)?.values() ?? [])
 			changes.push({
 				start: 0,
 				end: 0,
