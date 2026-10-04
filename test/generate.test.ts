@@ -1805,6 +1805,49 @@ export type Contract = UserMapping;`,
 	);
 });
 
+test('two contracts sharing a class name are delegated to separately', async (t) => {
+	// Arrange: identical shapes, so only the instance proves which contract ran.
+	const f = contracts(
+		t,
+		{
+			'a/User.ts': `export class AlphaUser { id!: string }
+/** @mapper */
+export abstract class UserMapping {
+  abstract toUser(source: { id: string }): AlphaUser;
+}`,
+			'b/User.ts': `export class BetaUser { id!: string }
+/** @mapper */
+export abstract class UserMapping {
+  abstract toUser(source: { id: string }): BetaUser;
+}`,
+			'Sensor.ts': `import { getMapper } from 'mappergen';
+import type { UserMapping as Alpha, AlphaUser } from './a/User.js';
+import type { UserMapping as Beta, BetaUser } from './b/User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /**
+   * @delegate owner Alpha.toUser
+   * @delegate reviewer Beta.toUser
+   */
+  abstract toDto(source: { owner: { id: string }; reviewer: { id: string } }): { owner: AlphaUser; reviewer: BetaUser };
+}
+export const sensors = getMapper(SensorMapping);`,
+		},
+		{},
+		['**/*.ts'],
+	);
+
+	// Act
+	const module = await executeFile(f, 'Sensor.js');
+	const alpha = await import(pathToFileURL(join(f.dir, 'dist/a/User.js')).href);
+	const beta = await import(pathToFileURL(join(f.dir, 'dist/b/User.js')).href);
+	const result = module.sensors.toDto({ owner: { id: 'u1' }, reviewer: { id: 'u2' } });
+
+	// Assert
+	assert.ok(result.owner instanceof alpha.AlphaUser);
+	assert.ok(result.reviewer instanceof beta.BetaUser);
+});
+
 test('a renamed type-only import is delegated under the name the contract exports', async (t) => {
 	// Arrange
 	const f = contracts(
