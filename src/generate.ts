@@ -1,4 +1,4 @@
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 
 import type TypeScript from '@typescript/typescript6';
 import MagicString, { type SourceMap } from 'magic-string';
@@ -81,6 +81,8 @@ export function generateWithMaps(
 	const errors: string[] = [];
 	const edits = new Map<string, SourceEdit[]>();
 	const needsRuntime = new Set<string>();
+	// Delegated contracts the generated code imports itself: file -> exported name -> import.
+	const needsContract = new Map<string, Map<string, { alias: string; specifier: string }>>();
 	// Aliased so an injected import cannot shadow or collide with handwritten names.
 	const runtime = '__mappergenGetMapper';
 
@@ -96,6 +98,66 @@ export function generateWithMaps(
 	const tags = (node: TypeScript.Node) => ts.getJSDocTags(node);
 	const text = (tag: TypeScript.JSDocTag): string =>
 		typeof tag.comment === 'string' ? tag.comment.trim() : '';
+
+	const isMapper = (node: TypeScript.Node): boolean =>
+		tags(node).some((t) => t.tagName.text === 'mapper');
+
+	const mappedFiles = program
+		.getSourceFiles()
+		.filter((file) => roots.includes(file.fileName) && !file.isDeclarationFile);
+
+	// A delegate may name any contract the build generates, so a delegating file does not
+	// have to import one. Collected up front because the caller may be compiled first.
+	const contractsByName = new Map<string, TypeScript.ClassDeclaration[]>();
+	for (const file of mappedFiles) {
+		for (const statement of file.statements) {
+			if (!ts.isClassDeclaration(statement) || !statement.name || !isMapper(statement)) continue;
+			const name = statement.name.text;
+			contractsByName.set(name, [...(contractsByName.get(name) ?? []), statement]);
+		}
+	}
+
+	// A type-only import is erased, so its name cannot be called at runtime.
+	const isTypeOnly = (symbol: TypeScript.Symbol | undefined): boolean =>
+		(symbol?.declarations ?? []).some((imported) => {
+			let node: TypeScript.Node | undefined = imported;
+			while (node && !ts.isSourceFile(node)) {
+				if (
+					(ts.isImportClause(node) ||
+						ts.isImportSpecifier(node) ||
+						ts.isImportEqualsDeclaration(node)) &&
+					node.isTypeOnly
+				)
+					return true;
+				node = node.parent;
+			}
+			return false;
+		});
+
+	/** Name a delegated contract in generated code, importing it into that file once. */
+	function referenceContract(
+		from: TypeScript.SourceFile,
+		contract: TypeScript.ClassDeclaration,
+		exported: string,
+	): string {
+		// Module resolution substitutes the source extension, so the output one is emitted.
+		const path = relative(dirname(from.fileName), contract.getSourceFile().fileName)
+			.split(sep)
+			.join('/')
+			.replace(/\.tsx?$/, '.js')
+			.replace(/\.mts$/, '.mjs')
+			.replace(/\.cts$/, '.cjs');
+
+		const alias = `__mappergen${exported}`;
+		// Keyed by name, so several fields delegating to one contract share the import.
+		const imports = needsContract.get(from.fileName) ?? new Map();
+		imports.set(exported, {
+			alias,
+			specifier: JSON.stringify(path.startsWith('.') ? path : `./${path}`),
+		});
+		needsContract.set(from.fileName, imports);
+		return alias;
+	}
 
 	function getSymbolType(symbol: TypeScript.Symbol | undefined): TypeScript.Type {
 		const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
@@ -271,14 +333,9 @@ export function generateWithMaps(
 	}
 
 	// Resolve each contract against the source and target types before generating methods.
-	for (const file of program.getSourceFiles()) {
-		if (!roots.includes(file.fileName) || file.isDeclarationFile) continue;
+	for (const file of mappedFiles) {
 		for (const mapperClass of file.statements) {
-			if (
-				!ts.isClassDeclaration(mapperClass) ||
-				!tags(mapperClass).some((t) => t.tagName.text === 'mapper')
-			)
-				continue;
+			if (!ts.isClassDeclaration(mapperClass) || !isMapper(mapperClass)) continue;
 			try {
 				if (
 					!mapperClass.name ||
@@ -427,6 +484,8 @@ export function generateWithMaps(
 								parts.length === 2 ? [parts[0], parts[1]] : [undefined, parts[0]];
 
 							let owner: TypeScript.ClassDeclaration = mapperClass;
+							// How generated code names the contract: the qualifier, or an injected alias.
+							let reference = qualifier;
 							if (qualifier && qualifier !== name) {
 								const alias = checker.resolveName(
 									qualifier,
@@ -439,35 +498,42 @@ export function generateWithMaps(
 										? checker.getAliasedSymbol(alias)
 										: alias;
 								const declaration = symbol?.declarations?.find(ts.isClassDeclaration);
-								if (!declaration || !tags(declaration).some((t) => t.tagName.text === 'mapper'))
-									fail(
-										method,
-										`Delegate '${rule.delegate}': '${qualifier}' must be an @mapper contract in scope.`,
-									);
-								// A type-only import leaves nothing to call at runtime.
-								for (const imported of alias?.declarations ?? []) {
-									let node: TypeScript.Node | undefined = imported;
-									while (node && !ts.isSourceFile(node)) {
-										if (
-											(ts.isImportClause(node) ||
-												ts.isImportSpecifier(node) ||
-												ts.isImportEqualsDeclaration(node)) &&
-											node.isTypeOnly
-										)
-											fail(
-												method,
-												`Delegate '${rule.delegate}' needs a runtime import of '${qualifier}'. Replace import type with a regular import.`,
-											);
-										node = node.parent;
-									}
+
+								if (symbol && declaration) {
+									if (!isMapper(declaration))
+										fail(
+											method,
+											`Delegate '${rule.delegate}': '${qualifier}' must be an @mapper contract in scope or in the mapping project.`,
+										);
+									// Only a contract the build generates ever receives its marker.
+									if (!roots.includes(declaration.getSourceFile().fileName))
+										fail(
+											method,
+											`Delegate '${rule.delegate}': '${qualifier}' is not part of the mapping project, so it is never generated.`,
+										);
+									owner = declaration;
+									// An erased import leaves nothing to call, so generate one instead.
+									// The contract is imported under the name it exports, not a local alias.
+									if (isTypeOnly(alias))
+										reference = referenceContract(file, declaration, symbol.name);
+								} else {
+									const candidates = contractsByName.get(qualifier) ?? [];
+									if (candidates.length > 1)
+										fail(
+											method,
+											`Delegate '${rule.delegate}': '${qualifier}' names more than one @mapper contract in the project (${candidates
+												.map((candidate) => candidate.getSourceFile().fileName)
+												.join(', ')}). Import the one you mean, or rename a contract.`,
+										);
+									const [found] = candidates;
+									if (!found)
+										fail(
+											method,
+											`Delegate '${rule.delegate}': '${qualifier}' must be an @mapper contract in scope or in the mapping project.`,
+										);
+									owner = found;
+									reference = referenceContract(file, found, qualifier);
 								}
-								// Only a contract the build generates ever receives its marker.
-								if (!roots.includes(declaration.getSourceFile().fileName))
-									fail(
-										method,
-										`Delegate '${rule.delegate}': '${qualifier}' is not part of the mapping project, so it is never generated.`,
-									);
-								owner = declaration;
 							}
 
 							// Only abstract methods qualify; those are the ones the build generates.
@@ -533,7 +599,7 @@ export function generateWithMaps(
 							let receiver = 'this';
 							if (owner !== mapperClass) {
 								needsRuntime.add(file.fileName);
-								receiver = `${runtime}(${qualifier})`;
+								receiver = `${runtime}(${reference})`;
 							}
 							const call = `${receiver}.${memberName}(${access})`;
 							expression = call;
@@ -684,6 +750,13 @@ export function generateWithMaps(
 				start: 0,
 				end: 0,
 				text: `import { getMapper as ${runtime} } from 'mappergen';\n`,
+			});
+
+		for (const [exported, { alias, specifier }] of needsContract.get(file) ?? [])
+			changes.push({
+				start: 0,
+				end: 0,
+				text: `import { ${exported} as ${alias} } from ${specifier};\n`,
 			});
 
 		const content = new MagicString(sourceFile.text);

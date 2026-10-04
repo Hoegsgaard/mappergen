@@ -52,13 +52,14 @@
 	"scripts": {
 		"build": "tsc6 -p tsconfig.build.json",
 		"typecheck": "tsc6 -p tsconfig.json",
-		"check": "npm run build && node dist/cli.js --project examples/basic/tsconfig.json --validate",
+		"typecheck:example": "tsc6 -p examples/basic/tsconfig.json",
+		"check": "npm run build && npm run typecheck:example && node dist/cli.js --project examples/basic/tsconfig.json --validate",
 		"pretest": "npm run build && tsc6 -p tsconfig.test.json",
 		"test": "node --test .test-dist/*.test.js",
 		"prepare": "npm run build",
 		"format": "prettier --write .",
 		"format:check": "prettier --check .",
-		"verify": "npm run format:check && npm test && node dist/cli.js --project examples/basic/tsconfig.json --validate"
+		"verify": "npm run format:check && npm test && npm run typecheck:example && node dist/cli.js --project examples/basic/tsconfig.json --validate"
 	},
 	"dependencies": {
 		"@typescript/typescript6": "~6.0.2",
