@@ -1476,6 +1476,7 @@ function contracts(
 	t: TestContext,
 	files: Record<string, string>,
 	compilerOptions: Record<string, unknown> = {},
+	include: readonly string[] = ['*.ts'],
 ) {
 	const dir = mkdtempSync(join(tmpdir(), 'mappergen-cross-'));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -1495,7 +1496,7 @@ function contracts(
 				outDir: 'dist',
 				...compilerOptions,
 			},
-			include: ['*.ts'],
+			include,
 		}),
 	);
 	for (const [name, source] of Object.entries(files)) {
@@ -1503,6 +1504,20 @@ function contracts(
 		writeFileSync(join(dir, name), source);
 	}
 	return { dir, project };
+}
+
+// The generator only typechecks transformed modules, so anything a consumer's own tsc
+// reports about the sources they wrote — an unused import, say — needs its own program.
+function handwrittenErrors(f: { dir: string; project: string }): string[] {
+	const parsed = ts.parseJsonConfigFileContent(
+		ts.readConfigFile(f.project, ts.sys.readFile).config,
+		ts.sys,
+		f.dir,
+	);
+	const program = ts.createProgram(parsed.fileNames, parsed.options);
+	return ts
+		.getPreEmitDiagnostics(program)
+		.map((d) => `TS${d.code}: ${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
 }
 
 async function executeFile(f: { dir: string; project: string }, emitted: string) {
@@ -1529,10 +1544,12 @@ export abstract class UserMapping {
 }`;
 
 test('delegates to a contract in another file that stays usable on its own', async (t) => {
-	// Arrange
-	const f = contracts(t, {
-		'User.ts': USER_CONTRACT,
-		'Sensor.ts': `import { getMapper } from 'mappergen';
+	// Arrange: the contract is imported and used in code, so nothing is injected.
+	const f = contracts(
+		t,
+		{
+			'User.ts': USER_CONTRACT,
+			'Sensor.ts': `import { getMapper } from 'mappergen';
 import { UserMapping, type UserModel, UserPublicModel } from './User.js';
 export class SensorDto { id!: string; owner?: UserPublicModel }
 /** @mapper */
@@ -1543,13 +1560,16 @@ export abstract class SensorMapping {
 export const sensors = getMapper(SensorMapping);
 export const users = getMapper(UserMapping);
 export { UserPublicModel };`,
-	});
+		},
+		{ noUnusedLocals: true },
+	);
 	const owner = { id: 'u1', firstName: 'Ada', secret: 'hidden' };
 
 	// Act
 	const module = await executeFile(f, 'Sensor.js');
 
 	// Assert
+	assert.deepEqual(handwrittenErrors(f), []);
 	const nested = module.sensors.toDto({ id: 's1', owner });
 	assert.equal(nested.id, 's1');
 	assert.ok(nested.owner instanceof module.UserPublicModel);
@@ -1654,21 +1674,26 @@ export abstract class Mapper {
   abstract toDto(source: { owner: { id: string } }): { owner: { id: string } };
 }`,
 		},
-		expected: /'Missing' must be an @mapper contract in scope/,
+		expected: /'Missing' must be an @mapper contract in scope or in the mapping project/,
 	},
 	{
-		name: 'rejects a type-only import of the delegate contract',
+		name: 'rejects a contract name that two files in the project share',
 		files: {
-			'User.ts': USER_CONTRACT,
-			'Sensor.ts': `import type { UserMapping } from './User.js';
-import type { UserModel, UserPublicModel } from './User.js';
-/** @mapper */
+			'First.ts': `/** @mapper */
+export abstract class UserMapping {
+  abstract toUser(source: { id: string }): { id: string };
+}`,
+			'Second.ts': `/** @mapper */
+export abstract class UserMapping {
+  abstract toUser(source: { id: string }): { id: string };
+}`,
+			'Sensor.ts': `/** @mapper */
 export abstract class SensorMapping {
   /** @delegate owner UserMapping.toUser */
-  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+  abstract toDto(source: { owner: { id: string } }): { owner: { id: string } };
 }`,
 		},
-		expected: /needs a runtime import of 'UserMapping'/,
+		expected: /'UserMapping' names more than one @mapper contract in the project/,
 	},
 	{
 		name: 'rejects a delegate contract outside the mapping project',
@@ -1717,30 +1742,142 @@ export abstract class SensorMapping {
 	});
 }
 
-test('an injected runtime import is used, so generated output survives noUnusedLocals', async (t) => {
-	// Arrange
+const OWNER = { id: 'u1', firstName: 'Ada', secret: 'hidden' };
+
+test('a delegated contract needs no import, so the handwritten source survives noUnusedLocals', async (t) => {
+	// Arrange: only the models are imported; the contract is named by the rule alone.
 	const f = contracts(
 		t,
 		{
 			'User.ts': USER_CONTRACT,
 			'Sensor.ts': `import { getMapper } from 'mappergen';
-import { UserMapping, type UserModel, UserPublicModel } from './User.js';
+import type { UserModel, UserPublicModel } from './User.js';
 /** @mapper */
 export abstract class SensorMapping {
-  /** @delegate owner UserMapping.toUser */
-  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+  /**
+   * @delegate owner UserMapping.toUser
+   * @delegate reviewer UserMapping.toUser
+   */
+  abstract toDto(source: { owner: UserModel; reviewer: UserModel }): { owner: UserPublicModel; reviewer: UserPublicModel };
 }
 export const sensors = getMapper(SensorMapping);`,
 		},
 		{ noUnusedLocals: true },
 	);
 
-	// Act
+	// Act: two fields share one contract, so the file receives a single import of it.
 	const module = await executeFile(f, 'Sensor.js');
-	const result = module.sensors.toDto({
-		owner: { id: 'u1', firstName: 'Ada', secret: 'hidden' },
-	});
 
 	// Assert
+	assert.deepEqual(handwrittenErrors(f), []);
+	const result = module.sensors.toDto({ owner: OWNER, reviewer: OWNER });
 	assert.deepEqual({ ...result.owner }, { id: 'u1', firstName: 'Ada' });
+	assert.deepEqual({ ...result.reviewer }, { id: 'u1', firstName: 'Ada' });
+});
+
+test('a type-only import of the delegate contract is enough', async (t) => {
+	// Arrange: erased at runtime, so the generated code must import the contract itself.
+	const f = contracts(
+		t,
+		{
+			'User.ts': USER_CONTRACT,
+			'Sensor.ts': `import { getMapper } from 'mappergen';
+import type { UserMapping, UserModel, UserPublicModel } from './User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}
+export const sensors = getMapper(SensorMapping);
+export type Contract = UserMapping;`,
+		},
+		{ noUnusedLocals: true },
+	);
+
+	// Act
+	const module = await executeFile(f, 'Sensor.js');
+
+	// Assert
+	assert.deepEqual(handwrittenErrors(f), []);
+	assert.deepEqual(
+		{ ...module.sensors.toDto({ owner: OWNER }).owner },
+		{ id: 'u1', firstName: 'Ada' },
+	);
+});
+
+test('a renamed type-only import is delegated under the name the contract exports', async (t) => {
+	// Arrange
+	const f = contracts(
+		t,
+		{
+			'User.ts': USER_CONTRACT,
+			'Sensor.ts': `import { getMapper } from 'mappergen';
+import type { UserMapping as Users, UserModel, UserPublicModel } from './User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner Users.toUser */
+  abstract toDto(source: { owner: UserModel }): { owner: UserPublicModel };
+}
+export const sensors = getMapper(SensorMapping);
+export type Contract = Users;`,
+		},
+		{ noUnusedLocals: true },
+	);
+
+	// Act
+	const module = await executeFile(f, 'Sensor.js');
+
+	// Assert
+	assert.deepEqual(handwrittenErrors(f), []);
+	assert.deepEqual(
+		{ ...module.sensors.toDto({ owner: OWNER }).owner },
+		{ id: 'u1', firstName: 'Ada' },
+	);
+});
+
+test('a delegated contract is reached from a file that imports nothing from it', async (t) => {
+	// Arrange: no shared import to borrow a specifier from, including across directories.
+	const f = contracts(
+		t,
+		{
+			'User.ts': USER_CONTRACT,
+			'Sensor.ts': `import { getMapper } from 'mappergen';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: { id: string; firstName: string; secret: string } }): { owner: { id: string; firstName: string } };
+}
+export const sensors = getMapper(SensorMapping);`,
+			'nested/Deep.ts': `import { getMapper } from 'mappergen';
+/** @mapper */
+export abstract class DeepMapping {
+  /** @delegate owner UserMapping.toUser */
+  abstract toDto(source: { owner: { id: string; firstName: string; secret: string } }): { owner: { id: string; firstName: string } };
+}
+export const deep = getMapper(DeepMapping);`,
+		},
+		{ noUnusedLocals: true },
+		['**/*.ts'],
+	);
+
+	// Act
+	const sameDirectory = await executeFile(f, 'Sensor.js');
+	const subdirectory = await import(pathToFileURL(join(f.dir, 'dist/nested/Deep.js')).href);
+
+	// Assert
+	assert.deepEqual(handwrittenErrors(f), []);
+	assert.deepEqual(
+		{ ...sameDirectory.sensors.toDto({ owner: OWNER }).owner },
+		{
+			id: 'u1',
+			firstName: 'Ada',
+		},
+	);
+	assert.deepEqual(
+		{ ...subdirectory.deep.toDto({ owner: OWNER }).owner },
+		{
+			id: 'u1',
+			firstName: 'Ada',
+		},
+	);
 });

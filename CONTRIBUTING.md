@@ -25,9 +25,10 @@ Use Node.js 22.12+ (22.x), 24.x or 26.x and npm.
    ```
 
 `npm ci` builds the library through its `prepare` hook. `npm run verify` checks
-formatting, builds the library, compiles and runs the tests, and validates the basic
-example. Tests include public type declarations, real Vite integration and an npm
-tarball installed in a temporary consumer. Nothing is published by these checks.
+formatting, builds the library, compiles and runs the tests, and typechecks and
+validates the basic example. Tests include public type declarations, real Vite
+integration and an npm tarball installed in a temporary consumer. Nothing is published
+by these checks.
 
 ## Make a change
 
@@ -50,13 +51,13 @@ npm run format
 npm run verify
 ```
 
-For targeted work, `npm test` builds and runs the tests; `npm run check` builds and
-validates the basic example. `npm run typecheck` checks source and tests without
-emitting files. Tests import the built library, so run `npm run build` after source
-changes before a standalone typecheck or testing a linked consumer. `npm test`
-handles that build order automatically. The installed-package test uses
-`npm_execpath` supplied by npm; run it through `npm test` rather than invoking
-`node --test` directly.
+For targeted work, `npm test` builds and runs the tests; `npm run check` builds, then
+typechecks and validates the basic example. `npm run typecheck` checks source and tests
+without emitting files, `npm run typecheck:example` only the example. Tests import the
+built library, so run `npm run build` after source changes before a standalone typecheck
+or testing a linked consumer. `npm test` handles that build order automatically. The
+installed-package test uses `npm_execpath` supplied by npm; run it through `npm test`
+rather than invoking `node --test` directly.
 
 ## Open a pull request
 

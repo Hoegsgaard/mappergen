@@ -1,6 +1,6 @@
 import { getMapper } from 'mappergen';
 
-import { UserDto, UserMapping, type UserRow } from './UserMapping.js';
+import { UserDto, type UserRow } from './UserMapping.js';
 
 // No framework, ORM or decorators on the models.
 export interface PlacementRow {

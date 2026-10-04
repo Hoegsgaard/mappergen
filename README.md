@@ -141,9 +141,11 @@ console.log(dto instanceof SensorDto); // true
 ```
 
 Run your normal Vite development or build command. Methods are generated in memory;
-only target fields are copied. Missing fields, incompatible types and invalid annotations fail the build.
-Method calls are type-checked by TypeScript; annotation field names are checked by
-MapperGen, and do not have editor autocomplete or rename support.
+only target fields are copied. Missing fields, incompatible types and invalid
+annotations fail the build.
+Method calls are type-checked by TypeScript; the names inside annotations — fields,
+converters and contracts — are checked by MapperGen, and do not have editor
+autocomplete or rename support.
 
 ## Mapping rules
 
@@ -152,16 +154,16 @@ must be public, have one required explicitly typed input parameter and an explic
 object return type. `getMapper(Contract)` returns a typed, cached instance after
 build transformation; calling it without transformation fails immediately.
 
-| Rule                                 | Behavior                                                              |
-| ------------------------------------ | --------------------------------------------------------------------- |
-| Same field name                      | Copy compatible scalar values automatically.                          |
-| Null/undefined mismatch              | Bridge it automatically when the underlying types match.              |
-| `@map target=name source=sensorName` | Rename a source field. Named arguments may appear in either order.    |
-| `@convert reading toNumber`          | Pass the source value to a concrete public/protected instance method. |
-| `@delegate placement toPlacement`    | Map the field with another abstract mapping method on the contract.   |
-| `@delegate owner Contract.method`    | Same, but the method lives on another `@mapper` contract.             |
-| `@map` with either                   | Rename first, then convert or delegate the selected source value.     |
-| Source-only field                    | Exclude it from the result.                                           |
+| Rule                                           | Behavior                                                              |
+| ---------------------------------------------- | --------------------------------------------------------------------- |
+| Same field name                                | Copy compatible scalar values automatically.                          |
+| Null/undefined mismatch                        | Bridge it automatically when the underlying types match.              |
+| `@map target=targetField source=sourceField`   | Rename a source field. Named arguments may appear in either order.    |
+| `@convert targetField converterMethod`         | Pass the source value to a concrete public/protected instance method. |
+| `@delegate targetField mappingMethod`          | Map the field with another abstract mapping method on the contract.   |
+| `@delegate targetField Contract.mappingMethod` | Same, for a contract elsewhere in the project. No import needed.      |
+| `@map` with either                             | Rename first, then convert or delegate the selected source value.     |
+| Source-only field                              | Exclude it from the result.                                           |
 
 MapperGen processes only `@map`, `@convert` and `@delegate` on mapping methods. Other
 tags, including JSDoc and custom documentation tags, are ignored. Misspelled tag names
@@ -206,8 +208,6 @@ A delegate on **another contract** is named `Contract.method`, so a mapper you a
 on its own can be reused instead of duplicated:
 
 ```ts
-import { UserMapping } from './UserMapping.js';
-
 /** @mapper */
 export abstract class SensorMapping {
 	/** @delegate owner UserMapping.toDto */
@@ -215,16 +215,11 @@ export abstract class SensorMapping {
 }
 ```
 
-The named contract must be in scope, carry `@mapper`, be part of the same mapping project
-— otherwise it is never generated — and be imported at runtime rather than with
-`import type`. MapperGen calls it through its cached `getMapper` instance, so it behaves
-exactly as it does for its own callers.
-
-One wrinkle: TypeScript does not resolve names inside a JSDoc tag, so under
-`noUnusedLocals` your own `tsc` and editor report the import as unused even though the
-generated code needs it. The generated output itself stays clean. Use the contract
-somewhere in the file — `export const users = getMapper(UserMapping);` is usually
-wanted anyway — or silence it for that import.
+No import of `UserMapping` is needed. The name is resolved in the file's scope, then
+against the project's `@mapper` contracts — where it must be unambiguous — and the
+generated code imports the contract itself, calling it through its cached `getMapper`
+instance. It still has to carry `@mapper` and belong to the mapping project, or it is
+never generated.
 
 A delegate's parameter cannot be nullable — a mapping method's source must be a concrete
 object shape — so MapperGen bridges the empty case at the call site: `null`, `undefined`
@@ -242,12 +237,12 @@ itself; no converter is needed for a field that only changes how it spells "no v
 A `string | null` source fills a `string | undefined` target, and an optional source
 fills a `string | null` target. The target type decides the result:
 
-| Target field                | Result for a missing source value                                     |
-| --------------------------- | --------------------------------------------------------------------- |
-| `note?: string`             | Omitted from the result.                                              |
-| `note: string \| undefined` | `undefined`.                                                          |
-| `note: string \| null`      | `null`.                                                               |
-| `note?: string \| null`     | `null` stays `null`; only an absent or `undefined` source is omitted. |
+| Target field                 | Result for a missing source value                                     |
+| ---------------------------- | --------------------------------------------------------------------- |
+| `field?: string`             | Omitted from the result.                                              |
+| `field: string \| undefined` | `undefined`.                                                          |
+| `field: string \| null`      | `null`.                                                               |
+| `field?: string \| null`     | `null` stays `null`; only an absent or `undefined` source is omitted. |
 
 Optional targets are omitted rather than assigned `undefined`, so the result is the
 same with and without `exactOptionalPropertyTypes`. Falsy values are preserved:
@@ -368,9 +363,12 @@ Unsupported features:
 - **Delegate is a concrete method / Converter is an abstract mapping method**: the two
   tags are swapped. `@delegate` names an abstract mapping method; `@convert` names a
   handwritten one.
-- **Delegate qualifier is not an `@mapper` contract in scope / is not part of the mapping
-  project**: `@delegate field Contract.method` needs `Contract` imported at runtime, marked
-  `@mapper`, and included by the mapping project so that it is generated too.
+- **Delegate qualifier is not an `@mapper` contract / names more than one**: `Contract` in
+  `@delegate targetField Contract.mappingMethod` must be marked `@mapper`, included by
+  the mapping project so it is generated too, and unique there — rename or import to
+  disambiguate.
+- **TS6133 on a contract import**: unused because the annotation resolves the name on its
+  own. Delete the import.
 - **Class target needs a runtime import**: replace `import type` with a regular
   import of the target class.
 - A contract reports one error at a time. Because delegation couples mapping methods,
