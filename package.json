@@ -1,6 +1,6 @@
 {
 	"name": "mappergen",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"private": false,
 	"description": "Generate type-safe object mappers from TypeScript method signatures",
 	"keywords": [
