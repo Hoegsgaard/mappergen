@@ -2,7 +2,7 @@
 export function parseFieldRule(
 	tagName: 'map' | 'convert' | 'delegate',
 	comment: string,
-): { key: string; value: string } {
+): { key: string | undefined; value: string } {
 	if (tagName === 'map') {
 		const match = /^(target|source)\s*=\s*([^\s=]+)\s+(target|source)\s*=\s*([^\s=]+)$/.exec(
 			comment,
@@ -21,6 +21,9 @@ export function parseFieldRule(
 	}
 
 	const parts = comment.split(/\s+/);
+	if (tagName === 'delegate' && parts.length === 1 && parts[0]) {
+		return { key: undefined, value: parts[0] };
+	}
 	if (parts.length !== 2 || !parts[0] || !parts[1]) {
 		throw new Error(
 			tagName === 'delegate'

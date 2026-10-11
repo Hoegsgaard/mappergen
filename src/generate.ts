@@ -205,6 +205,72 @@ export function generateWithMaps(
 	const hasFlag = (type: TypeScript.Type, flag: TypeScript.TypeFlags): boolean =>
 		type.isUnion() ? type.types.some((t) => hasFlag(t, flag)) : Boolean(type.flags & flag);
 
+	const isEmpty = (type: TypeScript.Type): boolean =>
+		hasFlag(type, ts.TypeFlags.Null) || hasFlag(type, ts.TypeFlags.Undefined);
+
+	// isArrayType covers ReadonlyArray, not tuples.
+	const elementTypeOf = (type: TypeScript.Type): TypeScript.Type | undefined =>
+		checker.isArrayType(type)
+			? checker.getTypeArguments(type as TypeScript.TypeReference)[0]
+			: undefined;
+
+	const emptyElement = (element: TypeScript.Type): string | undefined =>
+		hasFlag(element, ts.TypeFlags.Undefined)
+			? 'undefined'
+			: hasFlag(element, ts.TypeFlags.Null)
+				? 'null'
+				: undefined;
+
+	function copyElement(
+		from: TypeScript.Type,
+		to: TypeScript.Type,
+		value: string,
+		depth: number,
+	): string | undefined {
+		const nested = copyArray(from, to, value, depth);
+		if (nested) return nested;
+		if (!canCopyDirectly(from) || !canCopyDirectly(to)) return undefined;
+		if (
+			!checker.isTypeAssignableTo(checker.getNonNullableType(from), checker.getNonNullableType(to))
+		)
+			return undefined;
+		if (checker.isTypeAssignableTo(from, to)) return value;
+		const empty = emptyElement(to);
+		return empty && `${value} ?? ${empty}`;
+	}
+
+	function copyArray(
+		from: TypeScript.Type,
+		to: TypeScript.Type,
+		expression: string,
+		depth: number,
+	): string | undefined {
+		const fromElement = elementTypeOf(from);
+		const toElement = elementTypeOf(to);
+		if (!fromElement || !toElement) return undefined;
+		if (isUnsupportedType(fromElement) || isUnsupportedType(toElement)) return undefined;
+
+		if (canCopyDirectly(fromElement) && checker.isTypeAssignableTo(fromElement, toElement))
+			return `[...${expression}]`;
+
+		const item = `__mappergenItem${depth}`;
+		const element = copyElement(fromElement, toElement, item, depth + 1);
+		return element && `${expression}.map((${item}) => ${element})`;
+	}
+
+	function delegateElements(
+		callee: string,
+		expression: string,
+		from: TypeScript.Type,
+		to: TypeScript.Type,
+	): string | undefined {
+		const item = '__mappergenItem0';
+		const call = `${callee}(${item})`;
+		if (!isEmpty(from)) return `${expression}.map((${item}) => ${call})`;
+		const empty = emptyElement(to);
+		return empty && `${expression}.map((${item}) => ${item} == null ? ${empty} : ${call})`;
+	}
+
 	const getObjectProperties = (
 		type: TypeScript.Type,
 		node: TypeScript.Node,
@@ -221,7 +287,7 @@ export function generateWithMaps(
 		) {
 			fail(
 				node,
-				`${label} must be a concrete object shape without unions, index signatures or call signatures.`,
+				`${label} must be a concrete object shape or an array; unions, tuples, index signatures and call signatures are unsupported.`,
 			);
 		}
 		return checker.getPropertiesOfType(type);
@@ -338,6 +404,210 @@ export function generateWithMaps(
 		});
 	}
 
+	function resolveDelegate(
+		spec: string,
+		method: TypeScript.MethodDeclaration,
+		mapperClass: TypeScript.ClassDeclaration,
+		file: TypeScript.SourceFile,
+	): { callee: string; signature: TypeScript.Signature } {
+		// `Contract.method` reaches another @mapper; a bare name stays local.
+		const parts = spec.split('.');
+		if (parts.length > 2 || parts.some((part) => !part))
+			fail(
+				method,
+				`Delegate '${spec}' must name a mapping method, optionally qualified as Contract.method.`,
+			);
+		const [qualifier, memberName] =
+			parts.length === 2 ? [parts[0], parts[1]] : [undefined, parts[0]];
+
+		let owner: TypeScript.ClassDeclaration = mapperClass;
+		// How generated code names the contract: the qualifier, or an injected alias.
+		let reference = qualifier;
+		if (qualifier && qualifier !== mapperClass.name?.text) {
+			const alias = checker.resolveName(
+				qualifier,
+				method,
+				ts.SymbolFlags.Class | ts.SymbolFlags.Alias,
+				false,
+			);
+			const symbol =
+				alias && alias.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(alias) : alias;
+			const declaration = symbol?.declarations?.find(ts.isClassDeclaration);
+
+			if (symbol && declaration) {
+				if (!isMapper(declaration))
+					fail(
+						method,
+						`Delegate '${spec}': '${qualifier}' must be an @mapper contract in scope or in the mapping project.`,
+					);
+				// Only a contract the build generates ever receives its marker.
+				if (!roots.includes(declaration.getSourceFile().fileName))
+					fail(
+						method,
+						`Delegate '${spec}': '${qualifier}' is not part of the mapping project, so it is never generated.`,
+					);
+				owner = declaration;
+				// An erased import leaves nothing to call, so generate one instead.
+				// The contract is imported under the name it exports, not a local alias.
+				if (isTypeOnly(alias))
+					reference = referenceContract(file, declaration, qualifier, symbol.name);
+			} else {
+				const candidates = contractsByName.get(qualifier) ?? [];
+				if (candidates.length > 1)
+					fail(
+						method,
+						`Delegate '${spec}': '${qualifier}' names more than one @mapper contract in the project (${candidates
+							.map((candidate) => candidate.getSourceFile().fileName)
+							.join(', ')}). Import the one you mean, or rename a contract.`,
+					);
+				const [found] = candidates;
+				if (!found)
+					fail(
+						method,
+						`Delegate '${spec}': '${qualifier}' must be an @mapper contract in scope or in the mapping project.`,
+					);
+				owner = found;
+				// Looked up by name, so the qualifier is the exported name.
+				reference = referenceContract(file, found, qualifier, qualifier);
+			}
+		}
+
+		// Only abstract methods qualify; those are the ones the build generates.
+		const delegate = owner.members.find(
+			(m): m is TypeScript.MethodDeclaration =>
+				ts.isMethodDeclaration(m) &&
+				ts.isIdentifier(m.name) &&
+				m.name.text === memberName &&
+				hasModifier(m, ts.SyntaxKind.AbstractKeyword),
+		);
+		if (!delegate) {
+			const concrete = owner.members.some(
+				(m) =>
+					ts.isMethodDeclaration(m) &&
+					ts.isIdentifier(m.name) &&
+					m.name.text === memberName &&
+					!!m.body,
+			);
+			fail(
+				method,
+				concrete
+					? `Delegate '${spec}' is a concrete method; use @convert for handwritten conversions.`
+					: `Delegate '${spec}' must be an abstract mapping method on ${owner === mapperClass ? 'the same contract' : `'${qualifier}'`}.`,
+			);
+		}
+		if (
+			hasModifier(delegate, ts.SyntaxKind.ProtectedKeyword) ||
+			hasModifier(delegate, ts.SyntaxKind.PrivateKeyword)
+		) {
+			fail(
+				method,
+				`Delegate '${spec}' must be a public abstract mapping method on the same contract.`,
+			);
+		}
+
+		const delegation = checker.getSignatureFromDeclaration(delegate);
+		if (!delegation) fail(delegate, 'Unable to resolve delegate signature.');
+
+		// Another contract is reached through its cached instance, not `this`.
+		let receiver = 'this';
+		if (owner !== mapperClass) {
+			needsRuntime.add(file.fileName);
+			receiver = `${runtime}(${reference})`;
+		}
+		return { callee: `${receiver}.${memberName}`, signature: delegation };
+	}
+
+	function listBody(
+		method: TypeScript.MethodDeclaration,
+		source: TypeScript.Type,
+		target: TypeScript.Type,
+		mapperClass: TypeScript.ClassDeclaration,
+		file: TypeScript.SourceFile,
+	): string {
+		const from = elementTypeOf(source);
+		const to = elementTypeOf(target);
+		if (!from || !to) {
+			fail(
+				method,
+				`A list mapping method must have an array source and an array target; received ${checker.typeToString(source)} and ${checker.typeToString(target)}.`,
+			);
+		}
+		if (isUnsupportedType(from) || isUnsupportedType(to)) {
+			fail(method, 'List elements have an unsupported type.');
+		}
+
+		let delegate: string | undefined;
+		for (const tag of tags(method)) {
+			const tagName = tag.tagName.text;
+			if (tagName !== 'map' && tagName !== 'convert' && tagName !== 'delegate') continue;
+			if (tagName !== 'delegate') {
+				fail(
+					tag,
+					`@${tagName} is not supported on a list mapping method: it maps elements, not fields.`,
+				);
+			}
+
+			let parsedRule: ReturnType<typeof parseFieldRule>;
+			try {
+				parsedRule = parseFieldRule(tagName, text(tag));
+			} catch (error) {
+				fail(tag, error instanceof Error ? error.message : String(error));
+			}
+			if (parsedRule.key !== undefined) {
+				fail(
+					tag,
+					'@delegate on a list mapping method names only the element mapping method, as @delegate mappingMethod.',
+				);
+			}
+			if (delegate) fail(tag, 'Duplicate @delegate for the elements.');
+			delegate = parsedRule.value;
+		}
+
+		if (!delegate) {
+			const copy = copyArray(source, target, 'source', 0);
+			if (!copy) {
+				fail(
+					method,
+					'Elements need an explicit rule: add @delegate to map them with another mapping method.',
+				);
+			}
+			return `    return ${copy};`;
+		}
+
+		const { callee, signature: delegation } = resolveDelegate(delegate, method, mapperClass, file);
+		const parameterType =
+			delegation.parameters.length === 1 ? getSymbolType(delegation.parameters[0]) : undefined;
+		if (
+			parameterType === undefined ||
+			!checker.isTypeAssignableTo(checker.getNonNullableType(from), parameterType)
+		) {
+			fail(
+				method,
+				`Delegate '${delegate}' cannot accept elements of type ${checker.typeToString(from)}.`,
+			);
+		}
+
+		const delegated = checker.getReturnTypeOfSignature(delegation);
+		if (
+			isUnsupportedType(delegated) ||
+			!checker.isTypeAssignableTo(delegated, checker.getNonNullableType(to))
+		) {
+			fail(
+				method,
+				`Delegate '${delegate}' cannot produce elements of target ${checker.typeToString(target)}.`,
+			);
+		}
+
+		const mapped = delegateElements(callee, 'source', from, to);
+		if (!mapped) {
+			fail(
+				method,
+				`Elements of type ${checker.typeToString(from)} allow null or undefined, but the target elements (${checker.typeToString(to)}) do not.`,
+			);
+		}
+		return `    return ${mapped};`;
+	}
+
 	// Resolve each contract against the source and target types before generating methods.
 	for (const file of mappedFiles) {
 		for (const mapperClass of file.statements) {
@@ -396,6 +666,21 @@ export function generateWithMaps(
 
 					const source = getSymbolType(signature.parameters[0]);
 					const target = checker.getReturnTypeOfSignature(signature);
+
+					const declared = `${method.name.text}(source: ${parameter.type.getText()}): ${method.type.getText()}`;
+					const emit = (body: string): void => {
+						changes.push({
+							start: method.getStart(),
+							end: method.end,
+							text: `${declared} {\n${body}\n  }`,
+						});
+					};
+
+					if (checker.isArrayType(source) || checker.isArrayType(target)) {
+						emit(listBody(method, source, target, mapperClass, file));
+						continue;
+					}
+
 					const sourceProperties = new Map(
 						getObjectProperties(source, method, 'Source').map((p) => [p.name, p]),
 					);
@@ -416,6 +701,11 @@ export function generateWithMaps(
 						}
 
 						const { key, value } = parsedRule;
+						if (key === undefined)
+							fail(
+								tag,
+								'Expected @delegate targetField mappingMethod; a single argument names the element mapping method of a list mapping method.',
+							);
 						if (!properties.some((p) => p.name === key))
 							fail(tag, `Unknown target field '${key}'.`);
 
@@ -479,138 +769,64 @@ export function generateWithMaps(
 						};
 
 						if (rule.delegate) {
-							// `Contract.method` reaches another @mapper; a bare name stays local.
-							const parts = rule.delegate.split('.');
-							if (parts.length > 2 || parts.some((part) => !part))
-								fail(
-									method,
-									`Delegate '${rule.delegate}' must name a mapping method, optionally qualified as Contract.method.`,
-								);
-							const [qualifier, memberName] =
-								parts.length === 2 ? [parts[0], parts[1]] : [undefined, parts[0]];
-
-							let owner: TypeScript.ClassDeclaration = mapperClass;
-							// How generated code names the contract: the qualifier, or an injected alias.
-							let reference = qualifier;
-							if (qualifier && qualifier !== name) {
-								const alias = checker.resolveName(
-									qualifier,
-									method,
-									ts.SymbolFlags.Class | ts.SymbolFlags.Alias,
-									false,
-								);
-								const symbol =
-									alias && alias.flags & ts.SymbolFlags.Alias
-										? checker.getAliasedSymbol(alias)
-										: alias;
-								const declaration = symbol?.declarations?.find(ts.isClassDeclaration);
-
-								if (symbol && declaration) {
-									if (!isMapper(declaration))
-										fail(
-											method,
-											`Delegate '${rule.delegate}': '${qualifier}' must be an @mapper contract in scope or in the mapping project.`,
-										);
-									// Only a contract the build generates ever receives its marker.
-									if (!roots.includes(declaration.getSourceFile().fileName))
-										fail(
-											method,
-											`Delegate '${rule.delegate}': '${qualifier}' is not part of the mapping project, so it is never generated.`,
-										);
-									owner = declaration;
-									// An erased import leaves nothing to call, so generate one instead.
-									// The contract is imported under the name it exports, not a local alias.
-									if (isTypeOnly(alias))
-										reference = referenceContract(file, declaration, qualifier, symbol.name);
-								} else {
-									const candidates = contractsByName.get(qualifier) ?? [];
-									if (candidates.length > 1)
-										fail(
-											method,
-											`Delegate '${rule.delegate}': '${qualifier}' names more than one @mapper contract in the project (${candidates
-												.map((candidate) => candidate.getSourceFile().fileName)
-												.join(', ')}). Import the one you mean, or rename a contract.`,
-										);
-									const [found] = candidates;
-									if (!found)
-										fail(
-											method,
-											`Delegate '${rule.delegate}': '${qualifier}' must be an @mapper contract in scope or in the mapping project.`,
-										);
-									owner = found;
-									// Looked up by name, so the qualifier is the exported name.
-									reference = referenceContract(file, found, qualifier, qualifier);
-								}
-							}
-
-							// Only abstract methods qualify; those are the ones the build generates.
-							const delegate = owner.members.find(
-								(m): m is TypeScript.MethodDeclaration =>
-									ts.isMethodDeclaration(m) &&
-									ts.isIdentifier(m.name) &&
-									m.name.text === memberName &&
-									hasModifier(m, ts.SyntaxKind.AbstractKeyword),
+							const { callee, signature: delegation } = resolveDelegate(
+								rule.delegate,
+								method,
+								mapperClass,
+								file,
 							);
-							if (!delegate) {
-								const concrete = owner.members.some(
-									(m) =>
-										ts.isMethodDeclaration(m) &&
-										ts.isIdentifier(m.name) &&
-										m.name.text === memberName &&
-										!!m.body,
-								);
-								fail(
-									method,
-									concrete
-										? `Delegate '${rule.delegate}' is a concrete method; use @convert for handwritten conversions.`
-										: `Delegate '${rule.delegate}' must be an abstract mapping method on ${owner === mapperClass ? 'the same contract' : `'${qualifier}'`}.`,
-								);
-							}
-							if (
-								hasModifier(delegate, ts.SyntaxKind.ProtectedKeyword) ||
-								hasModifier(delegate, ts.SyntaxKind.PrivateKeyword)
-							) {
-								fail(
-									method,
-									`Delegate '${rule.delegate}' must be a public abstract mapping method on the same contract.`,
-								);
-							}
-
-							const delegation = checker.getSignatureFromDeclaration(delegate);
-							if (!delegation) fail(delegate, 'Unable to resolve delegate signature.');
+							const parameterType =
+								delegation.parameters.length === 1
+									? getSymbolType(delegation.parameters[0])
+									: undefined;
+							const accepts = (value: TypeScript.Type): boolean =>
+								parameterType !== undefined && checker.isTypeAssignableTo(value, parameterType);
 
 							// A generated mapping method cannot declare a nullable parameter, so
 							// the call site drops the empty case instead of passing it on.
 							const input = checker.getNonNullableType(readType);
-							if (
-								delegation.parameters.length !== 1 ||
-								!checker.isTypeAssignableTo(input, getSymbolType(delegation.parameters[0]))
-							) {
-								fail(
-									method,
-									`Delegate '${rule.delegate}' cannot accept field '${sourceName}' (${checker.typeToString(input)}).`,
-								);
-							}
-
+							const fromElement = elementTypeOf(input);
+							const toElement = elementTypeOf(checker.getNonNullableType(targetType));
 							const delegated = checker.getReturnTypeOfSignature(delegation);
-							if (
-								isUnsupportedType(delegated) ||
-								!checker.isTypeAssignableTo(delegated, targetType)
-							)
+							const produces = (expected: TypeScript.Type, what: string): void => {
+								if (
+									isUnsupportedType(delegated) ||
+									!checker.isTypeAssignableTo(delegated, expected)
+								)
+									fail(
+										method,
+										`Delegate '${rule.delegate}' cannot produce ${what} '${property.name}' (${checker.typeToString(targetType)}).`,
+									);
+							};
+
+							let call: string;
+							if (accepts(input)) {
+								produces(targetType, 'target');
+								call = `${callee}(${access})`;
+							} else if (
+								fromElement &&
+								toElement &&
+								accepts(checker.getNonNullableType(fromElement))
+							) {
+								produces(checker.getNonNullableType(toElement), 'elements of target');
+								const mapped = delegateElements(callee, access, fromElement, toElement);
+								if (!mapped)
+									fail(
+										method,
+										`Field '${property.name}': elements of '${sourceName}' allow null or undefined, but the target elements (${checker.typeToString(toElement)}) do not.`,
+									);
+								call = mapped;
+							} else {
 								fail(
 									method,
-									`Delegate '${rule.delegate}' cannot produce target '${property.name}' (${checker.typeToString(targetType)}).`,
+									fromElement
+										? `Delegate '${rule.delegate}' cannot accept field '${sourceName}' (${checker.typeToString(input)}) or its elements (${checker.typeToString(fromElement)}).`
+										: `Delegate '${rule.delegate}' cannot accept field '${sourceName}' (${checker.typeToString(input)}).`,
 								);
-
-							// Another contract is reached through its cached instance, not `this`.
-							let receiver = 'this';
-							if (owner !== mapperClass) {
-								needsRuntime.add(file.fileName);
-								receiver = `${runtime}(${reference})`;
 							}
-							const call = `${receiver}.${memberName}(${access})`;
+
 							expression = call;
-							if (hasFlag(readType, ts.TypeFlags.Null) || hasFlag(readType, ts.TypeFlags.Undefined))
+							if (isEmpty(readType))
 								lift(
 									`${access} != null`,
 									(empty) => `${access} != null ? ${call} : ${empty}`,
@@ -670,40 +886,56 @@ export function generateWithMaps(
 
 							expression = `this.${rule.convert}(${expression})`;
 						} else {
-							if (!canCopyDirectly(sourceType) || !canCopyDirectly(targetType))
-								fail(
-									method,
-									`Field '${property.name}' needs an explicit rule: add @delegate to map it with another mapping method, or @convert for a handwritten conversion.`,
-								);
+							const copy = copyArray(
+								checker.getNonNullableType(readType),
+								checker.getNonNullableType(targetType),
+								access,
+								0,
+							);
+							if (copy) {
+								expression = copy;
+								if (isEmpty(readType))
+									lift(
+										`${access} != null`,
+										(empty) => `${access} != null ? ${copy} : ${empty}`,
+										`${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}`,
+									);
+							} else {
+								if (!canCopyDirectly(sourceType) || !canCopyDirectly(targetType))
+									fail(
+										method,
+										`Field '${property.name}' needs an explicit rule: add @delegate to map it with another mapping method, or @convert for a handwritten conversion.`,
+									);
 
-							// Compare payloads; null/undefined differences are lifted below, not rejected.
-							if (
-								!checker.isTypeAssignableTo(
-									checker.getNonNullableType(readType),
-									checker.getNonNullableType(targetType),
+								// Compare payloads; null/undefined differences are lifted below, not rejected.
+								if (
+									!checker.isTypeAssignableTo(
+										checker.getNonNullableType(readType),
+										checker.getNonNullableType(targetType),
+									)
 								)
-							)
-								fail(
-									method,
-									`Field '${property.name}': ${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}; add @convert.`,
-								);
+									fail(
+										method,
+										`Field '${property.name}': ${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}; add @convert.`,
+									);
 
-							// Absence alone is handled by the `in` guard; a declared `undefined` is not.
-							const absenceOnly = sourceOptional && !hasFlag(sourceType, ts.TypeFlags.Undefined);
-							const liftNull = hasFlag(readType, ts.TypeFlags.Null) && !targetNull;
-							const liftUndefined =
-								hasFlag(readType, ts.TypeFlags.Undefined) &&
-								!targetUndefined &&
-								!(targetOptional && absenceOnly);
+								// Absence alone is handled by the `in` guard; a declared `undefined` is not.
+								const absenceOnly = sourceOptional && !hasFlag(sourceType, ts.TypeFlags.Undefined);
+								const liftNull = hasFlag(readType, ts.TypeFlags.Null) && !targetNull;
+								const liftUndefined =
+									hasFlag(readType, ts.TypeFlags.Undefined) &&
+									!targetUndefined &&
+									!(targetOptional && absenceOnly);
 
-							if (liftNull || liftUndefined)
-								lift(
-									`${access} ${targetNull ? '!== undefined' : '!= null'}`,
-									(empty) => `${access} ?? ${empty}`,
-									`${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}`,
-								);
-							else if (targetOptional && sourceOptional)
-								guard = `${JSON.stringify(sourceName)} in source`;
+								if (liftNull || liftUndefined)
+									lift(
+										`${access} ${targetNull ? '!== undefined' : '!= null'}`,
+										(empty) => `${access} ?? ${empty}`,
+										`${checker.typeToString(readType)} is not assignable to ${checker.typeToString(targetType)}`,
+									);
+								else if (targetOptional && sourceOptional)
+									guard = `${JSON.stringify(sourceName)} in source`;
+							}
 						}
 
 						if (constructor) {
@@ -718,15 +950,11 @@ export function generateWithMaps(
 						}
 					}
 
-					const body = constructor
-						? `    const target = new ${constructor}();\n${assignments.join('\n')}\n    return target;`
-						: `    return {\n${assignments.join('\n')}\n    };`;
-
-					changes.push({
-						start: method.getStart(),
-						end: method.end,
-						text: `${method.name.text}(source: ${parameter.type.getText()}): ${method.type.getText()} {\n${body}\n  }`,
-					});
+					emit(
+						constructor
+							? `    const target = new ${constructor}();\n${assignments.join('\n')}\n    return target;`
+							: `    return {\n${assignments.join('\n')}\n    };`,
+					);
 				}
 
 				if (!changes.length)

@@ -15,6 +15,9 @@ export class UserDto {
 /** @mapper */
 export abstract class UserMapping {
 	abstract toDto(source: UserRow): UserDto;
+
+	/** @delegate toDto */
+	abstract toDtos(source: readonly UserRow[]): UserDto[];
 }
 
 export const userMapping = getMapper(UserMapping);

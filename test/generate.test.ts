@@ -453,9 +453,15 @@ test('reports when the selected project contains no mapper contracts', (t) => {
 
 for (const { name, source, target, expected } of [
 	{
-		name: 'arrays need an explicit converter',
-		source: '{ items: string[] }',
-		target: '{ items: string[] }',
+		name: 'tuple fields need an explicit rule',
+		source: '{ pair: [string, number] }',
+		target: '{ pair: [string, number] }',
+		expected: /needs an explicit rule: add @delegate/,
+	},
+	{
+		name: 'Set fields need an explicit rule',
+		source: '{ tags: Set<string> }',
+		target: '{ tags: Set<string> }',
 		expected: /needs an explicit rule: add @delegate/,
 	},
 	{
@@ -969,10 +975,10 @@ for (const { name, source, target, expected } of [
 		expected: /number \| null is not assignable to string \| undefined; add @convert/,
 	},
 	{
-		name: 'nullable arrays still need an explicit converter',
+		name: 'a nullable array cannot fill a required array target',
 		source: '{ items: string[] | null }',
-		target: '{ items?: string[] }',
-		expected: /needs an explicit rule: add @delegate/,
+		target: '{ items: string[] }',
+		expected: /make the target optional or allow null or undefined/,
 	},
 ]) {
 	test(name, (t) => {
@@ -1421,15 +1427,16 @@ export abstract class Mapper {
 		expected: /'toAssignee' cannot receive UserModel \| null; make the target optional/,
 	},
 	{
-		name: 'rejects an array field delegated to an element mapping method',
+		name: 'rejects an array field delegated to a method that fits neither the array nor its elements',
 		contract: `${NESTED}
 /** @mapper */
 export abstract class Mapper {
   /** @delegate users toUser */
   abstract toOutput(source: { users: UserModel[] }): { users: UserDto[] };
-  abstract toUser(source: UserModel): UserDto;
+  abstract toUser(source: { other: string }): UserDto;
 }`,
-		expected: /Delegate 'toUser' cannot accept field 'users' \(UserModel\[\]\)/,
+		expected:
+			/Delegate 'toUser' cannot accept field 'users' \(UserModel\[\]\) or its elements \(UserModel\)/,
 	},
 	{
 		name: 'rejects a field carrying both @convert and @delegate',
@@ -1924,3 +1931,527 @@ export const deep = getMapper(DeepMapping);`,
 		},
 	);
 });
+
+// Array mapping: copied for scalar elements, delegated for objects.
+
+test('copies an array field of scalars without a converter, defensively', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: string[] }): { items: string[] };
+}`,
+	);
+	const items = ['a', 'b'];
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toDto({ items });
+
+	// Assert
+	assert.deepEqual(result, { items: ['a', 'b'] });
+	assert.notEqual(result.items, items);
+});
+
+test('copies a nested array field at every level', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { rows: number[][] }): { rows: number[][] };
+}`,
+	);
+	const inner = [1, 2];
+	const rows = [inner];
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toDto({ rows });
+
+	// Assert
+	assert.deepEqual(result, { rows: [[1, 2]] });
+	assert.notEqual(result.rows, rows);
+	assert.notEqual(result.rows[0], inner);
+});
+
+test('copies a readonly array into a mutable target and back', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: readonly string[] }): { items: string[] };
+  abstract toReadonly(source: { items: string[] }): { items: readonly string[] };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ items: ['a'] }), { items: ['a'] });
+	assert.deepEqual(mapper.toReadonly({ items: ['a'] }), { items: ['a'] });
+});
+
+test('copies an array of dates without cloning the instances', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { stamps: Date[] }): { stamps: Date[] };
+}`,
+	);
+	const stamp = new Date('2020-01-02T03:04:05.000Z');
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toDto({ stamps: [stamp] });
+
+	// Assert
+	assert.equal(result.stamps[0], stamp);
+});
+
+test('bridges element null to undefined while copying', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: (string | null)[] }): { items: (string | undefined)[] };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ items: ['a', null] }), { items: ['a', undefined] });
+});
+
+test('copies elements that already allow null', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: (string | null)[] }): { items: (string | null)[] };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ items: ['a', null] }), { items: ['a', null] });
+});
+
+test('omits an optional array target when the source array is null', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: string[] | null }): { items?: string[] };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ items: ['a'] }), { items: ['a'] });
+	assert.deepEqual(Object.hasOwn(mapper.toDto({ items: null }), 'items'), false);
+});
+
+test('lifts a null array to an undefined target', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: string[] | null }): { items: string[] | undefined };
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDto({ items: null }), { items: undefined });
+});
+
+for (const exactOptionalPropertyTypes of [false, true]) {
+	test(`guards an optional array field on its value, not its presence (EOPT=${exactOptionalPropertyTypes})`, async (t) => {
+		// Arrange: with exactOptionalPropertyTypes off, a caller can still pass an
+		// explicit undefined, so a spread of the raw value would crash.
+		const f = fixture(
+			t,
+			`/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items?: string[] }): { items?: string[] };
+}`,
+			{ exactOptionalPropertyTypes },
+		);
+
+		// Act
+		const mapper = await execute(f);
+
+		// Assert
+		assert.deepEqual(mapper.toDto({ items: ['a'] }), { items: ['a'] });
+		assert.deepEqual(Object.hasOwn(mapper.toDto({}), 'items'), false);
+		assert.deepEqual(Object.hasOwn(mapper.toDto({ items: undefined }), 'items'), false);
+	});
+}
+
+test('delegates an array field element-wise to an element mapping method', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate users toUser */
+  abstract toOutput(source: { users: UserModel[] }): { users: UserDto[] };
+  abstract toUser(source: UserModel): UserDto;
+}`,
+	);
+	const user = { id: 'u1', firstName: 'Ada', secret: 'hidden' };
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toOutput({ users: [user] });
+
+	// Assert
+	assert.deepEqual(result, { users: [{ id: 'u1', firstName: 'Ada' }] });
+	assert.notEqual(result.users[0], user);
+});
+
+test('delegates an array field whole to a list mapping method', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate users toUsers */
+  abstract toOutput(source: { users: UserModel[] }): { users: UserDto[] };
+  /** @delegate toUser */
+  abstract toUsers(source: UserModel[]): UserDto[];
+  abstract toUser(source: UserModel): UserDto;
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toOutput({ users: [{ id: 'u1', firstName: 'Ada', secret: 'x' }] }), {
+		users: [{ id: 'u1', firstName: 'Ada' }],
+	});
+});
+
+test('delegates a nullable array field element-wise and omits it when empty', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate users toUser */
+  abstract toOutput(source: { users: UserModel[] | null }): { users?: UserDto[] };
+  abstract toUser(source: UserModel): UserDto;
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toOutput({ users: [{ id: 'u1', firstName: 'Ada', secret: 'x' }] }), {
+		users: [{ id: 'u1', firstName: 'Ada' }],
+	});
+	assert.deepEqual(Object.hasOwn(mapper.toOutput({ users: null }), 'users'), false);
+});
+
+test('bridges a nullable element to a nullable target element when delegating', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate users toUser */
+  abstract toOutput(source: { users: (UserModel | null)[] }): { users: (UserDto | null)[] };
+  abstract toUser(source: UserModel): UserDto;
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(
+		mapper.toOutput({ users: [{ id: 'u1', firstName: 'Ada', secret: 'x' }, null] }),
+		{
+			users: [{ id: 'u1', firstName: 'Ada' }, null],
+		},
+	);
+});
+
+test('generates a list mapping method from an element mapping method', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: UserModel): UserDto;
+  /** @delegate toDto */
+  abstract toDtos(source: UserModel[]): UserDto[];
+}`,
+	);
+	const user = { id: 'u1', firstName: 'Ada', secret: 'hidden' };
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toDtos([user]);
+
+	// Assert
+	assert.deepEqual(result, [{ id: 'u1', firstName: 'Ada' }]);
+	assert.notEqual(result[0], user);
+});
+
+test('generates a list mapping method over a readonly source', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: UserModel): UserDto;
+  /** @delegate toDto */
+  abstract toDtos(source: readonly UserModel[]): UserDto[];
+}`,
+	);
+
+	// Act
+	const mapper = await execute(f);
+
+	// Assert
+	assert.deepEqual(mapper.toDtos([{ id: 'u1', firstName: 'Ada', secret: 'x' }]), [
+		{ id: 'u1', firstName: 'Ada' },
+	]);
+});
+
+test('copies a list mapping method of scalars without an annotation', async (t) => {
+	// Arrange
+	const f = fixture(
+		t,
+		`/** @mapper */
+export abstract class Mapper {
+  abstract toIds(source: string[]): string[];
+}`,
+	);
+	const ids = ['a'];
+
+	// Act
+	const mapper = await execute(f);
+	const result = mapper.toIds(ids);
+
+	// Assert
+	assert.deepEqual(result, ['a']);
+	assert.notEqual(result, ids);
+});
+
+for (const { name, contract, expected } of [
+	{
+		name: 'rejects a list source mapped to a single target',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate toDto */
+  abstract toDtos(source: UserModel[]): UserDto;
+  abstract toDto(source: UserModel): UserDto;
+}`,
+		expected: /must have an array source and an array target/,
+	},
+	{
+		name: 'rejects a single source mapped to a list target',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate toDto */
+  abstract toDtos(source: UserModel): UserDto[];
+  abstract toDto(source: UserModel): UserDto;
+}`,
+		expected: /must have an array source and an array target/,
+	},
+	{
+		name: 'rejects a nullable list source',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate toDto */
+  abstract toDtos(source: UserModel[] | null): UserDto[];
+  abstract toDto(source: UserModel): UserDto;
+}`,
+		expected: /must have an array source and an array target/,
+	},
+	{
+		name: 'rejects @map on a list mapping method',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /**
+   * @delegate toDto
+   * @map target=id source=other
+   */
+  abstract toDtos(source: UserModel[]): UserDto[];
+  abstract toDto(source: UserModel): UserDto;
+}`,
+		expected: /@map is not supported on a list mapping method/,
+	},
+	{
+		name: 'rejects @convert on a list mapping method',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @convert users toUsers */
+  abstract toDtos(source: UserModel[]): UserDto[];
+  protected toUsers(users: UserModel[]): UserDto[] { return users.map((u) => ({ id: u.id, firstName: u.firstName })); }
+}`,
+		expected: /@convert is not supported on a list mapping method/,
+	},
+	{
+		name: 'rejects a field-qualified delegate on a list mapping method',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate users toDto */
+  abstract toDtos(source: UserModel[]): UserDto[];
+  abstract toDto(source: UserModel): UserDto;
+}`,
+		expected: /@delegate on a list mapping method names only the element mapping method/,
+	},
+	{
+		name: 'rejects a list mapping method of objects without a delegate',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  abstract toDtos(source: UserModel[]): UserDto[];
+}`,
+		expected: /Elements need an explicit rule: add @delegate/,
+	},
+	{
+		name: 'rejects a list delegate that cannot produce the target elements',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate toOther */
+  abstract toDtos(source: UserModel[]): UserDto[];
+  abstract toOther(source: UserModel): { id: string };
+}`,
+		expected: /Delegate 'toOther' cannot produce elements of target/,
+	},
+	{
+		name: 'rejects a nullable element that the target elements cannot hold',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  /** @delegate users toUser */
+  abstract toOutput(source: { users: (UserModel | null)[] }): { users: UserDto[] };
+  abstract toUser(source: UserModel): UserDto;
+}`,
+		expected: /elements of 'users' allow null/,
+	},
+	{
+		name: 'rejects a nullable scalar element that the target elements cannot hold',
+		contract: `/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: (string | null)[] }): { items: string[] };
+}`,
+		expected: /needs an explicit rule: add @delegate/,
+	},
+	{
+		name: 'rejects a tuple as the whole source',
+		contract: `/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: [string, number]): { id: string };
+}`,
+		expected: /must be a concrete object shape or an array/,
+	},
+]) {
+	test(name, (t) => {
+		// Arrange
+		const f = fixture(t, contract);
+
+		// Act & Assert
+		assert.throws(() => generate(ts, f.project), expected);
+	});
+}
+
+test('a list mapping method delegates to a contract in another file', async (t) => {
+	// Arrange
+	const f = contracts(t, {
+		'User.ts': USER_CONTRACT,
+		'Sensor.ts': `import { getMapper } from 'mappergen';
+import type { UserModel } from './User.js';
+import { UserPublicModel } from './User.js';
+/** @mapper */
+export abstract class SensorMapping {
+  /** @delegate UserMapping.toUser */
+  abstract toUsers(source: UserModel[]): UserPublicModel[];
+}
+export const sensors = getMapper(SensorMapping);`,
+	});
+
+	// Act
+	const emitted = await executeFile(f, 'Sensor.js');
+
+	// Assert
+	assert.deepEqual(handwrittenErrors(f), []);
+	assert.deepEqual(
+		emitted.sensors.toUsers([OWNER]).map((user: object) => ({ ...user })),
+		[{ id: 'u1', firstName: 'Ada' }],
+	);
+});
+
+for (const { name, contract, expected } of [
+	{
+		name: 'rejects an array field of objects without a rule, instead of sharing and leaking them',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  abstract toOutput(source: { users: UserModel[] }): { users: UserDto[] };
+}`,
+		expected: /Field 'users' needs an explicit rule: add @delegate/,
+	},
+	{
+		name: 'rejects a nested array field of objects without a rule',
+		contract: `${NESTED}
+/** @mapper */
+export abstract class Mapper {
+  abstract toOutput(source: { groups: UserModel[][] }): { groups: UserDto[][] };
+}`,
+		expected: /Field 'groups' needs an explicit rule: add @delegate/,
+	},
+	{
+		name: 'rejects array elements whose payloads differ',
+		contract: `/** @mapper */
+export abstract class Mapper {
+  abstract toDto(source: { items: (number | null)[] }): { items: (string | undefined)[] };
+}`,
+		expected: /Field 'items' needs an explicit rule: add @delegate/,
+	},
+]) {
+	test(name, (t) => {
+		// Arrange
+		const f = fixture(t, contract);
+
+		// Act & Assert
+		assert.throws(() => generate(ts, f.project), expected);
+	});
+}

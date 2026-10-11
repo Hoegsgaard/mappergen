@@ -16,6 +16,8 @@ export interface SensorRow {
 	description: string | null;
 	owner: UserRow | null;
 	placement: PlacementRow;
+	tags: string[];
+	observers: UserRow[];
 	internalNote: string;
 }
 
@@ -33,6 +35,8 @@ export class SensorDto {
 	description?: string;
 	owner?: UserDto;
 	placement!: PlacementDto;
+	tags!: string[];
+	observers!: UserDto[];
 }
 
 /** @mapper */
@@ -42,6 +46,7 @@ export abstract class SensorMapping {
 	 * @convert reading toNumber
 	 * @delegate owner UserMapping.toDto
 	 * @delegate placement toPlacement
+	 * @delegate observers UserMapping.toDto
 	 */
 	abstract toDto(source: SensorRow): SensorDto;
 
